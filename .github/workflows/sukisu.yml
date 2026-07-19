@@ -1,11 +1,11 @@
-name: Build ProtonPlus + KernelSU-Next + SUSFS v1.5.5 (a52q)
+name: Build ProtonPlus + SukiSU Ultra + SUSFS + KPM (a52q)
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04   # 22.04 punya libtinfo5 yang dibutuhkan ckbuild.sh
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout kernel source (branch ksu-susfs)
         uses: actions/checkout@v4
@@ -14,30 +14,38 @@ jobs:
           ref: ksu-susfs
           fetch-depth: 1
 
-      - name: Pasang driver KSU-Next + SUSFS v1.5.5 (yang cocok dgn tree ini)
+      - name: Pasang driver SukiSU Ultra (manual hook, non-GKI)
         run: |
-          rm -rf KernelSU-Next
-          git clone -b next-v1.5.5 https://github.com/notfleshka/KernelSU-Next-susfs KernelSU-Next
+          rm -rf KernelSU KernelSU-Next
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
           echo "drivers/kernelsu -> $(readlink drivers/kernelsu)"
-          echo "cek SUSFS di driver (harus > 0):"; grep -c "SUSFS" KernelSU-Next/kernel/Kconfig
-          echo "version code:"; git -C KernelSU-Next rev-list --count HEAD
+          ls KernelSU/kernel | head
+
+      - name: Tempel integrasi SUSFS v1.5.5 ke driver SukiSU
+        run: |
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.14
+          cd KernelSU
+          patch -p1 < ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+          echo "cek SUSFS di driver (harus > 0):"; grep -c "SUSFS" kernel/Kconfig
 
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
 
-      - name: Aktifkan KSU + fitur hiding SUSFS
+      - name: Aktifkan SukiSU + KPM + fitur hiding SUSFS
         run: |
           cat >> arch/arm64/configs/vendor/ksu.config <<'EOF'
           CONFIG_KSU=y
-          # CONFIG_KSU_KPROBES_HOOK is not set
+          CONFIG_KSU_MANUAL_HOOK=y
+          CONFIG_KPM=y
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
           CONFIG_KSU_SUSFS_SUS_MOUNT=y
           CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
           CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
           CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
           CONFIG_KSU_SUSFS_TRY_UMOUNT=y
           CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
           CONFIG_KSU_SUSFS_SPOOF_UNAME=y
@@ -53,19 +61,17 @@ jobs:
           chmod +x ckbuild.sh
           bash ckbuild.sh ka52
 
-      - name: Verifikasi KSU & SUSFS benar-benar aktif di config
-        run: |
-          echo "=== CONFIG_KSU* di out/.config ==="
-          grep -E "CONFIG_KSU" out/.config || echo "!!! CONFIG_KSU TIDAK ADA !!!"
+      - name: Verifikasi KSU/SUSFS/KPM aktif
+        run: grep -E "CONFIG_KSU|CONFIG_KPM" out/.config || echo "!!! TIDAK ADA !!!"
 
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
         with:
-          name: ProtonPlus-KSUNext-SUSFS-a52q
+          name: ProtonPlus-SukiSU-SUSFS-a52q
           path: ProtonPlus_Resurrected_*.zip
           if-no-files-found: error
 
-      - name: Upload build log (untuk debugging)
+      - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
