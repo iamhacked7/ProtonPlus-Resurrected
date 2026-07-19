@@ -1,0 +1,73 @@
+name: Build ProtonPlus + SukiSU Ultra + SUSFS (a52q)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04   # 22.04 punya libtinfo5 yang dibutuhkan ckbuild.sh
+    steps:
+      - name: Checkout kernel source (master)
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 1
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Integrate SukiSU Ultra (branch susfs-main)
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
+          echo "--- drivers/Makefile KSU entry ---"; grep -i kernelsu drivers/Makefile || true
+          echo "--- drivers/Kconfig KSU entry ---"; grep -i kernelsu drivers/Kconfig || true
+
+      - name: Integrate SUSFS (kernel-4.14)
+        run: |
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.14
+          cp susfs4ksu/kernel_patches/fs/* fs/
+          cp susfs4ksu/kernel_patches/include/linux/* include/linux/
+          patch -p1 < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch
+
+      - name: Add SukiSU / SUSFS / KPM configs
+        run: |
+          cat >> arch/arm64/configs/vendor/ksu.config <<'EOF'
+          CONFIG_KPM=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          EOF
+
+      - name: Force build target to a52q
+        run: sed -i 's/^DO_A72Q=1/DO_A72Q=0/' ckbuild.sh
+
+      - name: Build kernel (KSU + a52q)
+        run: |
+          chmod +x ckbuild.sh
+          bash ckbuild.sh ka52
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProtonPlus-SukiSU-a52q
+          path: ProtonPlus_Resurrected_*.zip
+          if-no-files-found: error
+
+      - name: Upload build log (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: log.txt
+          if-no-files-found: ignore
