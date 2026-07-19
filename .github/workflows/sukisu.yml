@@ -1,4 +1,4 @@
-name: Build ProtonPlus + KernelSU-Next v3.3.0 + SUSFS (a52q)
+name: Build ProtonPlus + KernelSU-Next + SUSFS v1.5.5 (a52q)
 
 on:
   workflow_dispatch:
@@ -14,33 +14,35 @@ jobs:
           ref: ksu-susfs
           fetch-depth: 1
 
-      - name: Update KernelSU-Next ke v3.3.0 (samakan dengan Manager Anda)
+      - name: Pasang driver KSU-Next + SUSFS v1.5.5 (yang cocok dgn tree ini)
         run: |
           rm -rf KernelSU-Next
-          git clone -b v3.3.0 https://github.com/rifsxd/KernelSU-Next KernelSU-Next
+          git clone -b next-v1.5.5 https://github.com/notfleshka/KernelSU-Next-susfs KernelSU-Next
           echo "drivers/kernelsu -> $(readlink drivers/kernelsu)"
-          echo "isi KernelSU-Next/kernel:"; ls KernelSU-Next/kernel | head
-          echo "jumlah commit (untuk version code):"; git -C KernelSU-Next rev-list --count HEAD
+          echo "cek SUSFS di driver (harus > 0):"; grep -c "SUSFS" KernelSU-Next/kernel/Kconfig
+          echo "version code:"; git -C KernelSU-Next rev-list --count HEAD
 
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
 
-      - name: Aktifkan fitur-fitur hiding SUSFS
+      - name: Aktifkan KSU + fitur hiding SUSFS
         run: |
           cat >> arch/arm64/configs/vendor/ksu.config <<'EOF'
+          CONFIG_KSU=y
+          # CONFIG_KSU_KPROBES_HOOK is not set
+          CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
           CONFIG_KSU_SUSFS_SUS_MOUNT=y
           CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
           CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
           CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
           CONFIG_KSU_SUSFS_TRY_UMOUNT=y
           CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
           CONFIG_KSU_SUSFS_SPOOF_UNAME=y
           CONFIG_KSU_SUSFS_ENABLE_LOG=y
           CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          CONFIG_KSU_SUSFS_SPOOF_BOOTCONFIG=y
-          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
           EOF
 
       - name: Force build target ke a52q
@@ -50,6 +52,11 @@ jobs:
         run: |
           chmod +x ckbuild.sh
           bash ckbuild.sh ka52
+
+      - name: Verifikasi KSU & SUSFS benar-benar aktif di config
+        run: |
+          echo "=== CONFIG_KSU* di out/.config ==="
+          grep -E "CONFIG_KSU" out/.config || echo "!!! CONFIG_KSU TIDAK ADA !!!"
 
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
