@@ -1,4 +1,4 @@
-name: Build ProtonPlus + SukiSU Ultra + SUSFS + KPM (a52q)
+name: Build ProtonPlus + ReSukiSU + SUSFS (a52q)
 
 on:
   workflow_dispatch:
@@ -14,43 +14,36 @@ jobs:
           ref: ksu-susfs
           fetch-depth: 1
 
-      - name: Pasang driver SukiSU Ultra (manual hook, non-GKI)
+      - name: Pasang driver ReSukiSU (non-GKI, manual hook)
         run: |
           rm -rf KernelSU KernelSU-Next
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
           echo "drivers/kernelsu -> $(readlink drivers/kernelsu)"
-          ls KernelSU/kernel | head
-
-      - name: Tempel integrasi SUSFS v1.5.5 ke driver SukiSU
-        run: |
-          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.14
-          cd KernelSU
-          patch -p1 < ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
-          echo "cek SUSFS di driver (harus > 0):"; grep -c "SUSFS" kernel/Kconfig
+          echo "cek SUSFS di driver (harus > 0):"
+          grep -c "SUSFS" $(readlink -f drivers/kernelsu)/Kconfig || true
+          ls $(readlink -f drivers/kernelsu) | head
 
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
 
-      - name: Aktifkan SukiSU + KPM + fitur hiding SUSFS
+      - name: Aktifkan ReSukiSU + SUSFS
         run: |
           cat >> arch/arm64/configs/vendor/ksu.config <<'EOF'
           CONFIG_KSU=y
           CONFIG_KSU_MANUAL_HOOK=y
-          CONFIG_KPM=y
-          CONFIG_KALLSYMS=y
-          CONFIG_KALLSYMS_ALL=y
+          CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
+          CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
           CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
           CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
           CONFIG_KSU_SUSFS_SPOOF_UNAME=y
           CONFIG_KSU_SUSFS_ENABLE_LOG=y
           CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
           EOF
 
       - name: Force build target ke a52q
@@ -61,13 +54,13 @@ jobs:
           chmod +x ckbuild.sh
           bash ckbuild.sh ka52
 
-      - name: Verifikasi KSU/SUSFS/KPM aktif
-        run: grep -E "CONFIG_KSU|CONFIG_KPM" out/.config || echo "!!! TIDAK ADA !!!"
+      - name: Verifikasi KSU & SUSFS aktif
+        run: grep -E "CONFIG_KSU" out/.config || echo "!!! CONFIG_KSU TIDAK ADA !!!"
 
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
         with:
-          name: ProtonPlus-SukiSU-SUSFS-a52q
+          name: ProtonPlus-ReSukiSU-SUSFS-a52q
           path: ProtonPlus_Resurrected_*.zip
           if-no-files-found: error
 
