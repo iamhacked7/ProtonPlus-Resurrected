@@ -103,6 +103,7 @@ jobs:
       - name: Build kernel (KSU + a52q)
         run: |
           chmod +x ckbuild.sh
+          export WP="$(pwd)"
           bash ckbuild.sh ka52
 
       - name: Verifikasi CONFIG_KSU
