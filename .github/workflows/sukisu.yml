@@ -27,75 +27,69 @@ jobs:
         run: |
           python3 - <<'PYEOF'
           import pathlib, sys
-
           G, E = "#ifdef CONFIG_KSU_MANUAL_HOOK", "#endif"
-          fail = []
+          def rd(p): return pathlib.Path(p).read_text(encoding="utf-8", errors="surrogateescape")
+          def wr(p,s): pathlib.Path(p).write_text(s, encoding="utf-8", errors="surrogateescape")
+          def add_extern(s, block):
+              i = s.rfind("#include"); i = s.index("\n", i) + 1
+              return s[:i] + "\n" + block + "\n" + s[i:]
 
-          def patch(path, extern, anchor, call, before=False, name=""):
-              p = pathlib.Path(path); s = p.read_text()
-              if "CONFIG_KSU_MANUAL_HOOK" in s:
-                  print(f"[LEWAT] {name}: sudah ter-patch"); return
-              if anchor not in s:
-                  print(f"[GAGAL] {name}: anchor tidak ketemu"); fail.append(name); return
-              i = s.rfind("#include")
-              i = s.index("\n", i) + 1
-              s = s[:i] + "\n" + extern + "\n" + s[i:]
-              j = s.index(anchor)
-              if before:
-                  s = s[:j] + call + "\n" + s[j:]
-              else:
-                  j = s.index("{", j + len(anchor) - 1) + 1
-                  s = s[:j] + "\n" + call + s[j:]
-              p.write_text(s); print(f"[OK] {name}")
+          s = rd("fs/exec.c")
+          s = add_extern(s, f"{G}\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n\t\t\tvoid *argv, void *envp, int *flags);\n{E}")
+          a = "\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"
+          j = s.index(a)
+          s = s[:j] + f"{G}\n\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n{E}\n" + s[j:]
+          wr("fs/exec.c", s); print("[OK] execveat")
 
-          patch("fs/exec.c",
-            f"{G}\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n\t\t\tvoid *argv, void *envp, int *flags);\n{E}",
-            "\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);",
-            f"{G}\n\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n{E}",
-            before=True, name="execveat")
+          s = rd("fs/open.c")
+          s = add_extern(s, f"{G}\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n\t\t\tint *mode, int *flags);\n{E}")
+          a = "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)"
+          j = s.index("{", s.index(a)) + 1
+          s = s[:j] + f"\n{G}\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n{E}" + s[j:]
+          wr("fs/open.c", s); print("[OK] faccessat")
 
-          patch("fs/open.c",
-            f"{G}\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n\t\t\tint *mode, int *flags);\n{E}",
-            "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)",
-            f"{G}\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n{E}",
-            name="faccessat")
+          s = rd("fs/stat.c")
+          s = add_extern(s, f"{G}\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n"
+            "extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);\n"
+            "#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)\n"
+            f"extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);\n{E}\n{E}")
+          a = "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,"
+          j = s.index("{", s.index(a)) + 1
+          s = s[:j] + f"\n{G}\n\tksu_handle_stat(&dfd, &filename, &flag);\n{E}" + s[j:]
+          for fn, call in [
+            ("SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)", "ksu_handle_newfstat_ret(&fd, &statbuf);"),
+            ("SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)", "ksu_handle_fstat64_ret(&fd, &statbuf);")]:
+              k = s.index(fn); r = s.index("\n\treturn error;", k)
+              s = s[:r] + f"\n{G}\n\t{call}\n{E}" + s[r:]
+          wr("fs/stat.c", s); print("[OK] stat + newfstat_ret + fstat64_ret")
 
-          patch("fs/stat.c",
-            f"{G}\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n{E}",
-            "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,",
-            f"{G}\n\tksu_handle_stat(&dfd, &filename, &flag);\n{E}",
-            name="stat")
-
-          patch("fs/read_write.c",
-            f"{G}\nextern bool ksu_init_rc_hook __read_mostly;\nextern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n{E}",
-            "SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)",
-            f"{G}\n\tif (unlikely(ksu_init_rc_hook))\n\t\tksu_handle_sys_read(fd, &buf, &count);\n{E}",
-            name="sys_read")
-
-          patch("kernel/reboot.c",
-            f"{G}\nextern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n{E}",
-            "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,",
-            f"{G}\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n{E}",
-            name="sys_reboot")
-
-          if fail:
-              print("HOOK GAGAL:", fail); sys.exit(1)
+          s = rd("kernel/reboot.c")
+          s = add_extern(s, f"{G}\nextern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n{E}")
+          a = "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,"
+          j = s.index("{", s.index(a)) + 1
+          s = s[:j] + f"\n{G}\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n{E}" + s[j:]
+          wr("kernel/reboot.c", s); print("[OK] sys_reboot")
           PYEOF
+          echo "=== verifikasi simbol wajib ==="
+          for pair in "fs/exec.c:ksu_handle_execveat" "fs/open.c:ksu_handle_faccessat" \
+                      "fs/stat.c:ksu_handle_stat" "fs/stat.c:ksu_handle_newfstat_ret" \
+                      "fs/stat.c:ksu_handle_fstat64_ret" "kernel/reboot.c:ksu_handle_sys_reboot"; do
+            f=${pair%%:*}; sym=${pair##*:}; echo -n "  $sym: "; grep -c "$sym" "$f"
+          done
 
-      - name: Buat vendor/ksu.config (tidak ada di proton-v2)
+      - name: Buat vendor/ksu.config
         run: |
           cat > arch/arm64/configs/vendor/ksu.config <<'EOF'
           CONFIG_KSU=y
           CONFIG_KSU_MANUAL_HOOK=y
-          CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
           CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
+          CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y
+          CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
           EOF
           cat arch/arm64/configs/vendor/ksu.config
 
-      - name: Definisikan DO_A72Q (default tidak ada di ckbuild)
-        run: |
-          sed -i 's/^DO_A52Q=0/DO_A52Q=0\nDO_A72Q=0/' ckbuild.sh
-          grep -nE "^DO_A52Q=|^DO_A72Q=" ckbuild.sh
+      - name: Definisikan DO_A72Q
+        run: sed -i 's/^DO_A52Q=0/DO_A52Q=0\nDO_A72Q=0/' ckbuild.sh
 
       - name: Free up disk space
         run: sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
