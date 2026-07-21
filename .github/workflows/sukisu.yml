@@ -1,4 +1,4 @@
-name: Build ProtonPlus + ReSukiSU + SUSFS (a52q)
+name: Build ProtonPlus v2 + ReSukiSU (a52q)
 
 on:
   workflow_dispatch:
@@ -7,61 +7,113 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout kernel source (branch ksu-susfs)
+      - name: Checkout kernel source (ProtonKernel proton-v2)
         uses: actions/checkout@v4
         with:
-          repository: notfleshka/ProtonPlus-Resurrected
-          ref: ksu-susfs
+          repository: ProtonKernel/ProtonPlus_a572q
+          ref: proton-v2
           fetch-depth: 1
 
-      - name: Pasang driver ReSukiSU (non-GKI, manual hook)
+      - name: Info kernel
+        run: sed -n '1,5p' Makefile
+
+      - name: Pasang driver ReSukiSU
         run: |
           rm -rf KernelSU KernelSU-Next
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
           echo "drivers/kernelsu -> $(readlink drivers/kernelsu)"
-          echo "cek SUSFS di driver (harus > 0):"
-          grep -c "SUSFS" $(readlink -f drivers/kernelsu)/Kconfig || true
-          ls $(readlink -f drivers/kernelsu) | head
 
-      - name: Free up disk space
+      - name: Tambahkan manual hook ReSukiSU
         run: |
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
+          python3 - <<'PYEOF'
+          import pathlib, sys
 
-      - name: Aktifkan ReSukiSU + SUSFS
+          G, E = "#ifdef CONFIG_KSU_MANUAL_HOOK", "#endif"
+          fail = []
+
+          def patch(path, extern, anchor, call, before=False, name=""):
+              p = pathlib.Path(path); s = p.read_text()
+              if "CONFIG_KSU_MANUAL_HOOK" in s:
+                  print(f"[LEWAT] {name}: sudah ter-patch"); return
+              if anchor not in s:
+                  print(f"[GAGAL] {name}: anchor tidak ketemu"); fail.append(name); return
+              i = s.rfind("#include")
+              i = s.index("\n", i) + 1
+              s = s[:i] + "\n" + extern + "\n" + s[i:]
+              j = s.index(anchor)
+              if before:
+                  s = s[:j] + call + "\n" + s[j:]
+              else:
+                  j = s.index("{", j + len(anchor) - 1) + 1
+                  s = s[:j] + "\n" + call + s[j:]
+              p.write_text(s); print(f"[OK] {name}")
+
+          patch("fs/exec.c",
+            f"{G}\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n\t\t\tvoid *argv, void *envp, int *flags);\n{E}",
+            "\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);",
+            f"{G}\n\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n{E}",
+            before=True, name="execveat")
+
+          patch("fs/open.c",
+            f"{G}\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n\t\t\tint *mode, int *flags);\n{E}",
+            "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)",
+            f"{G}\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n{E}",
+            name="faccessat")
+
+          patch("fs/stat.c",
+            f"{G}\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n{E}",
+            "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,",
+            f"{G}\n\tksu_handle_stat(&dfd, &filename, &flag);\n{E}",
+            name="stat")
+
+          patch("fs/read_write.c",
+            f"{G}\nextern bool ksu_init_rc_hook __read_mostly;\nextern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n{E}",
+            "SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)",
+            f"{G}\n\tif (unlikely(ksu_init_rc_hook))\n\t\tksu_handle_sys_read(fd, &buf, &count);\n{E}",
+            name="sys_read")
+
+          patch("kernel/reboot.c",
+            f"{G}\nextern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n{E}",
+            "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,",
+            f"{G}\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n{E}",
+            name="sys_reboot")
+
+          if fail:
+              print("HOOK GAGAL:", fail); sys.exit(1)
+          PYEOF
+
+      - name: Buat vendor/ksu.config (tidak ada di proton-v2)
         run: |
-          cat >> arch/arm64/configs/vendor/ksu.config <<'EOF'
+          cat > arch/arm64/configs/vendor/ksu.config <<'EOF'
           CONFIG_KSU=y
           CONFIG_KSU_MANUAL_HOOK=y
           CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
           CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
-          CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_SUS_MAP=y
-          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
           EOF
+          cat arch/arm64/configs/vendor/ksu.config
 
-      - name: Force build target ke a52q
-        run: sed -i 's/^DO_A72Q=1/DO_A72Q=0/' ckbuild.sh
+      - name: Definisikan DO_A72Q (default tidak ada di ckbuild)
+        run: |
+          sed -i 's/^DO_A52Q=0/DO_A52Q=0\nDO_A72Q=0/' ckbuild.sh
+          grep -nE "^DO_A52Q=|^DO_A72Q=" ckbuild.sh
+
+      - name: Free up disk space
+        run: sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
 
       - name: Build kernel (KSU + a52q)
         run: |
           chmod +x ckbuild.sh
           bash ckbuild.sh ka52
 
-      - name: Verifikasi KSU & SUSFS aktif
+      - name: Verifikasi CONFIG_KSU
+        if: always()
         run: grep -E "CONFIG_KSU" out/.config || echo "!!! CONFIG_KSU TIDAK ADA !!!"
 
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
         with:
-          name: ProtonPlus-ReSukiSU-SUSFS-a52q
-          path: ProtonPlus_Resurrected_*.zip
+          name: ProtonPlusV2-ReSukiSU-a52q
+          path: ProtonPlus_*.zip
           if-no-files-found: error
 
       - name: Upload build log
