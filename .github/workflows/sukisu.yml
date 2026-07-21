@@ -88,8 +88,20 @@ jobs:
           EOF
           cat arch/arm64/configs/vendor/ksu.config
 
-      - name: Definisikan DO_A72Q
-        run: sed -i 's/^DO_A52Q=0/DO_A52Q=0\nDO_A72Q=0/' ckbuild.sh
+      - name: Definisikan DO_A72Q + matikan upload bashupload
+        run: |
+          sed -i 's/^DO_A52Q=0/DO_A52Q=0\nDO_A72Q=0/' ckbuild.sh
+          sed -i 's/^LOG_UPLOAD=1/LOG_UPLOAD=0/' ckbuild.sh
+          grep -nE "^DO_A52Q=|^DO_A72Q=|^LOG_UPLOAD=" ckbuild.sh
+
+      - name: Beri nama kernel (iamhacked)
+        run: |
+          sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-iamhacked"/' \
+            arch/arm64/configs/vendor/lineage-a52q_defconfig
+          sed -i 's/^PROTON_VER=.*/PROTON_VER="iamhacked"/' ckbuild.sh
+          : > .scmversion
+          grep -n "^CONFIG_LOCALVERSION" arch/arm64/configs/vendor/lineage-a52q_defconfig
+          grep -n "^PROTON_VER=" ckbuild.sh
 
       - name: Free up disk space
         run: sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
@@ -98,6 +110,8 @@ jobs:
         run: |
           chmod +x ckbuild.sh
           export WP="$(pwd)"
+          export KBUILD_BUILD_USER="iamhacked"
+          export KBUILD_BUILD_HOST="iamhacked"
           bash ckbuild.sh ka52
 
       - name: Verifikasi CONFIG_KSU
@@ -105,6 +119,7 @@ jobs:
         run: grep -E "CONFIG_KSU" out/.config || echo "!!! CONFIG_KSU TIDAK ADA !!!"
 
       - name: Upload flashable zip
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ProtonPlusV2-ReSukiSU-a52q
