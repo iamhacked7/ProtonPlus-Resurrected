@@ -1,0 +1,178 @@
+name: Build ProtonPlus + KSU-Next + SUSFS v1.5.5 — STEALTH HARDENED (a52q)
+
+# Setup C = Setup A yang terbukti boot, plus 7 pengerasan anti-deteksi.
+# Basis, driver, dan toolchain TIDAK diubah — hanya defconfig dan identitas build.
+#
+# Nilai penyamaran diambil dari boot.emmc.win stok di TWRP backup 2026-07-18,
+# dikonfirmasi silang dengan catatan perangkat pra-root. Lihat STOCK-UNAME-a52q.md.
+
+on:
+  workflow_dispatch:
+
+env:
+  # --- identitas build stok a52q (menggantikan runner@runnervm76tkm) ---
+  KBUILD_BUILD_USER: dpi
+  KBUILD_BUILD_HOST: 21DJ6916
+  KBUILD_BUILD_TIMESTAMP: "Wed Jun 11 15:04:38 KST 2025"
+  STOCK_LOCALVERSION: "-perf-28693687-abA525FXXSCFYF1"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04   # 22.04 punya libtinfo5 yang dibutuhkan ckbuild.sh
+    steps:
+      - name: Checkout kernel source (branch ksu-susfs)
+        uses: actions/checkout@v4
+        with:
+          repository: notfleshka/ProtonPlus-Resurrected
+          ref: ksu-susfs
+          fetch-depth: 1
+
+      - name: Pasang driver KSU-Next + SUSFS v1.5.5 (yang cocok dgn tree ini)
+        run: |
+          rm -rf KernelSU-Next
+          git clone -b next-v1.5.5 https://github.com/notfleshka/KernelSU-Next-susfs KernelSU-Next
+          echo "drivers/kernelsu -> $(readlink drivers/kernelsu)"
+          echo "cek SUSFS di driver (harus > 0):"; grep -c "SUSFS" KernelSU-Next/kernel/Kconfig
+          echo "version code:"; git -C KernelSU-Next rev-list --count HEAD
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
+
+      # ── PENGERASAN 1: hilangkan tanda "+" dari uname ──────────────────────
+      # scripts/setlocalversion menambahkan "+" saat pohon git tanpa tag.
+      # Berkas .scmversion kosong membuatnya tidak menambahkan apa pun.
+      - name: Kosongkan .scmversion (buang tanda "+")
+        run: |
+          printf '' > .scmversion
+          echo "  .scmversion dibuat kosong"
+
+      # ── PENGERASAN 2-6: defconfig ─────────────────────────────────────────
+      - name: Aktifkan KSU + SUSFS + pengerasan anti-deteksi
+        run: |
+          cat >> arch/arm64/configs/vendor/ksu.config <<EOF
+          CONFIG_KSU=y
+          # CONFIG_KSU_KPROBES_HOOK is not set
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+
+          # --- PERUBAHAN vs Setup A: matikan logging SUSFS ---
+          # Setup A memakai =y, akibatnya dmesg memuat baris harfiah
+          #   "KernelSU: susfs: umounting '/debug_ramdisk' for uid: 10075"
+          # yang terbaca aplikasi mana pun. =n menghapus kodenya sama sekali.
+          # CONFIG_KSU_SUSFS_ENABLE_LOG is not set
+
+          # --- BARU: tutup /proc/config.gz ---
+          # Setup A mengeksposnya berisi 17 baris CONFIG_KSU*.
+          # Kernel stok Samsung tidak punya berkas ini sama sekali.
+          # CONFIG_IKCONFIG_PROC is not set
+
+          # --- BARU: tutup dmesg dari aplikasi ---
+          # Android user build normalnya memang begini.
+          CONFIG_SECURITY_DMESG_RESTRICT=y
+
+          # --- BARU: samarkan nama kernel jadi stok ---
+          CONFIG_LOCALVERSION="${STOCK_LOCALVERSION}"
+          # CONFIG_LOCALVERSION_AUTO is not set
+          EOF
+          echo "=== ksu.config final ==="
+          tail -25 arch/arm64/configs/vendor/ksu.config
+
+      - name: Force build target ke a52q
+        run: sed -i 's/^DO_A72Q=1/DO_A72Q=0/' ckbuild.sh
+
+      - name: Build kernel (KSU + a52q)
+        run: |
+          chmod +x ckbuild.sh
+          bash ckbuild.sh ka52
+
+      # ── GERBANG MUTU: build gagal kalau ada satu saja yang meleset ────────
+      - name: Verifikasi 8 target pengerasan di out/.config
+        run: |
+          C=out/.config
+          fail=0
+          check_set() { grep -qx "$1" "$C" && echo "  OK    $1" || { echo "  GAGAL $1"; fail=1; }; }
+          # Opsi "harus mati" bisa muncul sebagai "# X is not set" ATAU tidak muncul
+          # sama sekali (kalau dependensinya ikut mati). Keduanya benar — yang salah
+          # hanya kalau ia benar-benar =y.
+          check_off() {
+            if grep -qx "$1=y" "$C"; then
+              echo "  GAGAL $1 masih =y"; fail=1
+            elif grep -qx "# $1 is not set" "$C"; then
+              echo "  OK    $1 = n"
+            else
+              echo "  OK    $1 tidak ada di config (dependensi mati)"
+            fi
+          }
+
+          echo "=== harus AKTIF ==="
+          check_set 'CONFIG_KSU=y'
+          check_set 'CONFIG_KSU_SUSFS=y'
+          check_set 'CONFIG_KSU_SUSFS_SPOOF_UNAME=y'
+          check_set 'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y'
+          check_set 'CONFIG_SECURITY_DMESG_RESTRICT=y'
+          check_set 'CONFIG_KALLSYMS_ALL=y'
+
+          echo "=== harus MATI ==="
+          check_off 'CONFIG_KSU_SUSFS_ENABLE_LOG'
+          check_off 'CONFIG_IKCONFIG_PROC'
+          check_off 'CONFIG_KSU_KPROBES_HOOK'
+
+          echo "=== LOCALVERSION ==="
+          grep '^CONFIG_LOCALVERSION=' "$C" || { echo "  GAGAL LOCALVERSION tidak ada"; fail=1; }
+          if grep -qx "CONFIG_LOCALVERSION=\"${STOCK_LOCALVERSION}\"" "$C"; then
+            echo "  OK    LOCALVERSION = ${STOCK_LOCALVERSION}"
+          else
+            echo "  GAGAL LOCALVERSION tidak tertimpa — defconfig utama menang."
+            echo "        Perbaiki dengan sed langsung ke arch/arm64/configs/<defconfig>."
+            fail=1
+          fi
+
+          [ "$fail" = "0" ] || { echo; echo "!!! Ada target pengerasan yang meleset — build dihentikan."; exit 1; }
+          echo; echo "Semua target pengerasan tercapai."
+
+      - name: Tampilkan identitas kernel hasil build
+        run: |
+          echo "=== string versi di dalam kernel hasil build ==="
+          strings -a out/arch/arm64/boot/Image* 2>/dev/null | grep -m2 "Linux version" || \
+            echo "  (terkompresi — periksa setelah flash lewat: cat /proc/version)"
+          echo
+          echo "Target yang diharapkan setelah flash:"
+          echo "  4.14.190${STOCK_LOCALVERSION} (${KBUILD_BUILD_USER}@${KBUILD_BUILD_HOST}) ... ${KBUILD_BUILD_TIMESTAMP}"
+          echo
+          echo "Stok asli sebagai pembanding:"
+          echo "  4.14.190-perf-28693687-abA525FXXSCFYF1 (dpi@21DJ6916) (clang 10.0.7 ...) #1 SMP PREEMPT Wed Jun 11 15:04:38 KST 2025"
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProtonPlus-KSUNext-SUSFS-STEALTH-a52q
+          path: ProtonPlus_Resurrected_*.zip
+          if-no-files-found: error
+
+      - name: Upload .config final (untuk audit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-config
+          path: out/.config
+          if-no-files-found: ignore
+
+      - name: Upload build log (untuk debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: log.txt
+          if-no-files-found: ignore
