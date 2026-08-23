@@ -1,6 +1,6 @@
 name: Build ProtonPlus + KSU-Next + SUSFS v1.5.5 — STEALTH HARDENED (a52q)
 
-# Setup C = Setup A yang terbukti boot, plus 7 pengerasan anti-deteksi.
+# Setup C = Setup A yang terbukti boot, plus 6 pengerasan anti-deteksi.
 # Basis, driver, dan toolchain TIDAK diubah — hanya defconfig dan identitas build.
 #
 # Nilai penyamaran diambil dari boot.emmc.win stok di TWRP backup 2026-07-18,
@@ -67,11 +67,21 @@ jobs:
           CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
           CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
 
-          # --- PERUBAHAN vs Setup A: matikan logging SUSFS ---
-          # Setup A memakai =y, akibatnya dmesg memuat baris harfiah
-          #   "KernelSU: susfs: umounting '/debug_ramdisk' for uid: 10075"
-          # yang terbaca aplikasi mana pun. =n menghapus kodenya sama sekali.
-          # CONFIG_KSU_SUSFS_ENABLE_LOG is not set
+          # --- HARUS =y, JANGAN dimatikan ---
+          # Percobaan build 23 Agu 2026 dengan =n GAGAL saat link:
+          #   ld.lld: error: undefined symbol: susfs_is_log_enabled
+          #   referenced by core_hook.c:1077 (ksu_try_umount, susfs_try_umount_all)
+          # Sebabnya bug penjagaan #ifdef di fork ini: pemanggil di core_hook.c:1077
+          # dijaga CONFIG_KSU_SUSFS_TRY_UMOUNT, bukan CONFIG_KSU_SUSFS_ENABLE_LOG.
+          # Karena TRY_UMOUNT=y, pemanggilnya ikut ter-compile sementara
+          # variabelnya hilang. Membiarkan =y adalah satu-satunya pilihan aman.
+          #
+          # Kebocoran dmesg TETAP tertutup lewat dua lapis lain:
+          #   1. CONFIG_SECURITY_DMESG_RESTRICT=y di bawah -> aplikasi tidak bisa
+          #      membaca dmesg sama sekali, apa pun isinya (sisi pembaca)
+          #   2. susfs_log=0 di /data/adb/susfs4ksu/config.sh -> pesannya tidak
+          #      ditulis sejak awal (sisi penulis)
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
 
           # --- BARU: tutup /proc/config.gz ---
           # Setup A mengeksposnya berisi 17 baris CONFIG_KSU*.
@@ -98,7 +108,7 @@ jobs:
           bash ckbuild.sh ka52
 
       # ── GERBANG MUTU: build gagal kalau ada satu saja yang meleset ────────
-      - name: Verifikasi 8 target pengerasan di out/.config
+      - name: Verifikasi target pengerasan di out/.config
         run: |
           C=out/.config
           fail=0
@@ -123,9 +133,9 @@ jobs:
           check_set 'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y'
           check_set 'CONFIG_SECURITY_DMESG_RESTRICT=y'
           check_set 'CONFIG_KALLSYMS_ALL=y'
+          check_set 'CONFIG_KSU_SUSFS_ENABLE_LOG=y'   # wajib =y, lihat catatan di atas
 
           echo "=== harus MATI ==="
-          check_off 'CONFIG_KSU_SUSFS_ENABLE_LOG'
           check_off 'CONFIG_IKCONFIG_PROC'
           check_off 'CONFIG_KSU_KPROBES_HOOK'
 
