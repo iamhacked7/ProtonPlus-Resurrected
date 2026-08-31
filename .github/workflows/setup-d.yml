@@ -1,0 +1,164 @@
+name: Build ProtonPlus + KSU-Next + SUSFS + KPROBE — HOOK-LAB (a52q)
+
+# HOOK-LAB = varian riset kernel hooking: kprobe + ftrace + modules DIAKTIFKAN,
+# SUSFS TETAP AKTIF (root tetap bisa di-hide). Untuk flash bergantian dengan
+# varian STEALTH (SETUP-C). JANGAN pakai ini buat daily/stealth — jejak kprobe
+# bisa kedeteksi app level tinggi.
+#
+# Basis = SETUP-C-stealth-hardened.yml (terbukti boot) + permukaan hooking dibuka.
+#
+# SETELAH FLASH, jalankan ini sekali (root) biar kallsyms kebaca:
+#   su -c 'sysctl -w kernel.kptr_restrict=0'
+#   su -c 'mount -t debugfs none /sys/kernel/debug'
+#   su -c 'cat /proc/config.gz | grep KPROBES'   # cek config aktif
+
+on:
+  workflow_dispatch:
+
+env:
+  KBUILD_BUILD_USER: dpi
+  KBUILD_BUILD_HOST: 21DJ6916
+  KBUILD_BUILD_TIMESTAMP: "Wed Jun 11 15:04:38 KST 2025"
+  STOCK_LOCALVERSION: "-perf-28693687-abA525FXXSCFYF1"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04   # 22.04 punya libtinfo5 yang dibutuhkan ckbuild.sh
+    steps:
+      - name: Checkout kernel source (branch ksu-susfs)
+        uses: actions/checkout@v4
+        with:
+          repository: notfleshka/ProtonPlus-Resurrected
+          ref: ksu-susfs
+          fetch-depth: 1
+
+      - name: Pasang driver KSU-Next + SUSFS v1.5.5
+        run: |
+          rm -rf KernelSU-Next
+          git clone -b next-v1.5.5 https://github.com/notfleshka/KernelSU-Next-susfs KernelSU-Next
+          echo "drivers/kernelsu -> $(readlink drivers/kernelsu)"
+          echo "cek SUSFS di driver:"; grep -c "SUSFS" KernelSU-Next/kernel/Kconfig
+          echo "version code:"; git -C KernelSU-Next rev-list --count HEAD
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
+
+      - name: Aktifkan KSU + SUSFS + PERMUKAAN HOOKING (kprobe/ftrace/modules)
+        run: |
+          cat >> arch/arm64/configs/vendor/ksu.config <<EOF
+          # ---------- ROOT (tetap, sama seperti SETUP-C) ----------
+          CONFIG_KSU=y
+          # CONFIG_KSU_KPROBES_HOOK is not set
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          # WAJIB =y (bug fork: undefined symbol susfs_is_log_enabled kalau =n).
+          # Di varian ini dmesg sengaja DIBUKA (lihat SECURITY_DMESG_RESTRICT di bawah).
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+
+          # ---------- PERMUKAAN HOOKING (BARU, ini inti HOOK-LAB) ----------
+          # Kprobe: hook fungsi kernel via nama simbol (register_kprobe)
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          # Ftrace function tracer: ftrace_set_filter_ip / ftrace_ops
+          CONFIG_FUNCTION_TRACER=y
+          CONFIG_DYNAMIC_FTRACE=y
+          # Ekspos raw_syscalls (sys_enter/sys_exit) di tracefs
+          CONFIG_FTRACE_SYSCALLS=y
+          CONFIG_TRACEPOINTS=y
+          # debugfs: mount buat kprobe_events
+          CONFIG_DEBUG_FS=y
+          # --- MODULES (opsional: buat insmod .ko kayak khook/ftrace-hook).
+          # Kalau build gagal di langkah link, komentari 2 baris ini.
+          CONFIG_MODULES=y
+          CONFIG_MODULE_UNLOAD=y
+
+          # ---------- BUKA akses riset (kebalikan SETUP-C) ----------
+          # /proc/config.gz HIDUP biar bisa cek config setelah boot
+          CONFIG_IKCONFIG=y
+          CONFIG_IKCONFIG_PROC=y
+          # dmesg kebaca root (tanpa pembatasan)
+          # CONFIG_SECURITY_DMESG_RESTRICT is not set
+          # identitas kernel disamarkan ke stok (biar app root-check ga langsung curiga)
+          CONFIG_LOCALVERSION="${STOCK_LOCALVERSION}"
+          # CONFIG_LOCALVERSION_AUTO is not set
+          EOF
+          echo "=== ksu.config final ==="
+          tail -30 arch/arm64/configs/vendor/ksu.config
+
+      - name: Kosongkan .scmversion (buang tanda "+")
+        run: printf '' > .scmversion
+
+      - name: Force build target ke a52q
+        run: sed -i 's/^DO_A72Q=1/DO_A72Q=0/' ckbuild.sh
+
+      - name: Build kernel (KSU + SUSFS + KPROBE + a52q)
+        run: |
+          chmod +x ckbuild.sh
+          bash ckbuild.sh ka52
+
+      - name: Verifikasi target HOOK-LAB di out/.config
+        run: |
+          C=out/.config
+          fail=0
+          check_set() { grep -qx "$1" "$C" && echo "  OK    $1" || { echo "  GAGAL $1"; fail=1; }; }
+          echo "=== harus AKTIF (root + hooking) ==="
+          check_set 'CONFIG_KSU=y'
+          check_set 'CONFIG_KSU_SUSFS=y'
+          check_set 'CONFIG_KPROBES=y'
+          check_set 'CONFIG_KPROBE_EVENTS=y'
+          check_set 'CONFIG_FUNCTION_TRACER=y'
+          check_set 'CONFIG_DYNAMIC_FTRACE=y'
+          check_set 'CONFIG_FTRACE_SYSCALLS=y'
+          check_set 'CONFIG_DEBUG_FS=y'
+          check_set 'CONFIG_IKCONFIG_PROC=y'
+          check_set 'CONFIG_KALLSYMS_ALL=y'
+          check_set 'CONFIG_KSU_SUSFS_ENABLE_LOG=y'
+          echo "=== MODULES (tidak wajib, hanya info) ==="
+          grep -E '^CONFIG_MODULES=' "$C" || echo "  (CONFIG_MODULES tidak aktif)"
+          echo "=== harus MATI (pilih manual hooks, bukan kprobe untuk KSU) ==="
+          if grep -qx 'CONFIG_KSU_KPROBES_HOOK=y' "$C"; then
+            echo "  GAGAL CONFIG_KSU_KPROBES_HOOK masih =y"; fail=1
+          else
+            echo "  OK    CONFIG_KSU_KPROBES_HOOK = n"
+          fi
+          [ "$fail" = "0" ] || { echo; echo "!!! Ada target HOOK-LAB yang meleset — build dihentikan."; exit 1; }
+          echo; echo "Semua target HOOK-LAB tercapai."
+
+      - name: Upload flashable zip
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProtonPlus-KSUNext-SUSFS-KPROBE-HOOKLAB-a52q
+          path: ProtonPlus_Resurrected_*.zip
+          if-no-files-found: error
+
+      - name: Upload .config final (untuk audit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hooklab-final-config
+          path: out/.config
+          if-no-files-found: ignore
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hooklab-build-log
+          path: log.txt
+          if-no-files-found: ignore
