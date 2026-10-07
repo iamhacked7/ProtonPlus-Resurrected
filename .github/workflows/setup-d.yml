@@ -1,16 +1,37 @@
-name: Build ProtonPlus + KSU-Next + SUSFS + KPROBE — HOOK-LAB (a52q)
+name: Kernel LAB — ProtonPlus + KSU-Next + SUSFS + KPROBES hooking (a52q)
 
-# HOOK-LAB = varian riset kernel hooking: kprobe + ftrace + modules DIAKTIFKAN,
-# SUSFS TETAP AKTIF (root tetap bisa di-hide). Untuk flash bergantian dengan
-# varian STEALTH (SETUP-C). JANGAN pakai ini buat daily/stealth — jejak kprobe
-# bisa kedeteksi app level tinggi.
+# ============================================================================
+# KERNEL LAB (riset hooking) — pasangan dari KERNEL HARIAN (setup-c-stealth.yml).
+# Keduanya dibangun dari tree dan driver yang sama; hanya defconfig yang beda.
+# Flash bergantian lewat TWRP (zip AnyKernel3).
 #
-# Basis = SETUP-C-stealth-hardened.yml (terbukti boot) + permukaan hooking dibuka.
+# Permukaan hooking yang dibuka:
+#   - kprobes + kretprobes      : primitif utama; hook fungsi kernel apa pun
+#                                 (termasuk nilai balik) dari modul .ko, runtime,
+#                                 tanpa rebuild 23 menit.
+#   - tracepoint sys_enter/exit : sudah ada di tree (HAVE_SYSCALL_TRACEPOINTS=y);
+#                                 ditambah FTRACE_SYSCALLS agar tampil di tracefs.
+#   - uprobes/UPROBE_EVENTS/BPF_EVENTS : sudah =y di defconfig a52q.
+#   - modul .ko tanpa paksa tanda tangan (MODULE_SIG_FORCE mati).
+#   - debugfs, /proc/config.gz dan dmesg terbuka.
 #
-# SETELAH FLASH, jalankan ini sekali (root) biar kallsyms kebaca:
+# Yang SENGAJA TIDAK dipakai:
+#   - FUNCTION_TRACER / DYNAMIC_FTRACE. arch/arm64/Kconfig tree ini tidak lagi
+#     men-select HAVE_DYNAMIC_FTRACE, dan arm64 4.14 memang tidak punya
+#     DYNAMIC_FTRACE_WITH_REGS (baru ada di 5.5), jadi ftrace-hook mustahil.
+#     FUNCTION_TRACER tanpa dynamic ftrace hanya menambah overhead mcount statis
+#     di setiap fungsi kernel. Pakai kprobes.
+#
+# JANGAN pakai kernel ini untuk harian: simbol kprobe di /proc/kallsyms,
+# /proc/modules, /proc/config.gz dan debugfs semuanya sidik jari.
+#
+# SETELAH FLASH (root), sekali:
 #   su -c 'sysctl -w kernel.kptr_restrict=0'
 #   su -c 'mount -t debugfs none /sys/kernel/debug'
-#   su -c 'cat /proc/config.gz | grep KPROBES'   # cek config aktif
+#   su -c 'mount -t tracefs none /sys/kernel/tracing'
+#   su -c 'zcat /proc/config.gz | grep -E "KPROBES|MODULE_SIG|FTRACE_SYSCALLS"'
+#   su -c 'insmod /data/local/tmp/hook.ko'   # modul dibangun dari tree+out/.config build ini
+# ============================================================================
 
 on:
   workflow_dispatch:
@@ -32,23 +53,28 @@ jobs:
           ref: ksu-susfs
           fetch-depth: 1
 
-      - name: Pasang driver KSU-Next + SUSFS v1.5.5
+      - name: Pasang driver KSU-Next + SUSFS v1.5.5 (sama dengan Kernel HARIAN)
         run: |
           rm -rf KernelSU-Next
           git clone -b next-v1.5.5 https://github.com/notfleshka/KernelSU-Next-susfs KernelSU-Next
           echo "drivers/kernelsu -> $(readlink drivers/kernelsu)"
-          echo "cek SUSFS di driver:"; grep -c "SUSFS" KernelSU-Next/kernel/Kconfig
+          echo "cek SUSFS di driver (harus > 0):"; grep -c "SUSFS" KernelSU-Next/kernel/Kconfig
           echo "version code:"; git -C KernelSU-Next rev-list --count HEAD
 
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
 
-      - name: Aktifkan KSU + SUSFS + PERMUKAAN HOOKING (kprobe/ftrace/modules)
+      - name: Kosongkan .scmversion (buang tanda "+")
+        run: printf '' > .scmversion
+
+      - name: Aktifkan KSU + SUSFS + PERMUKAAN HOOKING (kprobes/tracepoint/modul)
         run: |
           cat >> arch/arm64/configs/vendor/ksu.config <<EOF
-          # ---------- ROOT (tetap, sama seperti SETUP-C) ----------
+          # ---------- ROOT + SUSFS (identik dengan Kernel HARIAN) ----------
           CONFIG_KSU=y
+          # Hook KSU tetap MANUAL. Dengan KPROBES=y, opsi KSU_KPROBES_HOOK jadi
+          # tersedia dan default y di fork ini -> wajib dimatikan eksplisit.
           # CONFIG_KSU_KPROBES_HOOK is not set
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
@@ -63,114 +89,153 @@ jobs:
           CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
           CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
           CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          # WAJIB =y (bug fork: undefined symbol susfs_is_log_enabled kalau =n).
-          # Di varian ini dmesg sengaja DIBUKA (lihat SECURITY_DMESG_RESTRICT di bawah).
+          # WAJIB =y: bug fork, "undefined symbol: susfs_is_log_enabled" kalau =n.
+          # Di kernel LAB dmesg memang sengaja dibuka, jadi tidak ada yang hilang.
           CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          # WAJIB MATI: bug fork sucompat.c. Kalau KPROBES_HOOK=n tapi SUS_SU=y,
-          # fungsi ksu_susfs_enable/disable_sus_su() manggil execve_kp dkk yang ga
-          # ke-definisi (cuma ada di #ifdef KPROBES_HOOK) -> build error
-          # "use of undeclared identifier 'execve_kp'". Root TETAP jalan via
-          # manual hook (sucompat_non_kp=true), kprobe kernel tetap aktif utk riset.
+          # WAJIB MATI: bug fork sucompat.c. SUS_SU=y + KPROBES_HOOK=n memanggil
+          # execve_kp dkk yang hanya ada di #ifdef KPROBES_HOOK ->
+          # "use of undeclared identifier 'execve_kp'". Root tetap jalan via
+          # manual hook (sucompat_non_kp), kprobes kernel tetap aktif untuk riset.
           # CONFIG_KSU_SUSFS_SUS_SU is not set
+
+          # ---------- PERMUKAAN HOOKING ----------
+          # kprobes + kretprobes. KRETPROBES ikut otomatis (def_bool y bila
+          # KPROBES && HAVE_KRETPROBES; keduanya tersedia di arm64 tree ini).
+          CONFIG_KPROBES=y
+          # kprobe_events di tracefs: hook + dump argumen tanpa menulis modul
+          CONFIG_KPROBE_EVENTS=y
+          # event raw_syscalls:sys_enter / sys_exit di tracefs
+          CONFIG_FTRACE_SYSCALLS=y
+          # debugfs: /sys/kernel/debug/kprobes/list dan kawan-kawan
+          CONFIG_DEBUG_FS=y
           CONFIG_KALLSYMS=y
           CONFIG_KALLSYMS_ALL=y
-
-          # ---------- PERMUKAAN HOOKING (BARU, ini inti HOOK-LAB) ----------
-          # Kprobe: hook fungsi kernel via nama simbol (register_kprobe)
-          CONFIG_KPROBES=y
-          CONFIG_HAVE_KPROBES=y
-          CONFIG_KPROBE_EVENTS=y
-          # Ftrace function tracer: ftrace_set_filter_ip / ftrace_ops
-          CONFIG_FUNCTION_TRACER=y
-          CONFIG_DYNAMIC_FTRACE=y
-          # Ekspos raw_syscalls (sys_enter/sys_exit) di tracefs
-          CONFIG_FTRACE_SYSCALLS=y
-          CONFIG_TRACEPOINTS=y
-          # debugfs: mount buat kprobe_events
-          CONFIG_DEBUG_FS=y
-          # --- MODULES (opsional: buat insmod .ko kayak khook/ftrace-hook).
-          # Kalau build gagal di langkah link, komentari 2 baris ini.
+          # modul .ko buatan sendiri (khook, hook berbasis kprobes, dsb.)
           CONFIG_MODULES=y
           CONFIG_MODULE_UNLOAD=y
+          # Defconfig a52q memaksa tanda tangan modul (MODULE_SIG_FORCE=y) ->
+          # insmod .ko sendiri gagal "Required key not available". Matikan
+          # paksaannya; modul tanpa tanda tangan tetap dimuat (kernel di-taint).
+          # CONFIG_MODULE_SIG_FORCE is not set
+          # Lihat catatan di kepala berkas: tanpa dynamic ftrace, function tracer
+          # hanya overhead. Tidak dipakai.
+          # CONFIG_FUNCTION_TRACER is not set
 
-          # ---------- BUKA akses riset (kebalikan SETUP-C) ----------
-          # /proc/config.gz HIDUP biar bisa cek config setelah boot
+          # ---------- AKSES RISET TERBUKA (kebalikan Kernel HARIAN) ----------
+          # /proc/config.gz hidup agar config bisa dicek setelah boot
           CONFIG_IKCONFIG=y
           CONFIG_IKCONFIG_PROC=y
-          # dmesg kebaca root (tanpa pembatasan)
+          # dmesg terbaca root tanpa pembatasan
           # CONFIG_SECURITY_DMESG_RESTRICT is not set
-          # identitas kernel disamarkan ke stok (biar app root-check ga langsung curiga)
+          # identitas kernel tetap disamarkan ke stok supaya root-check tidak
+          # langsung curiga; sidik jari lain (kallsyms, modules) tetap ada.
           CONFIG_LOCALVERSION="${STOCK_LOCALVERSION}"
           # CONFIG_LOCALVERSION_AUTO is not set
           EOF
           echo "=== ksu.config final ==="
-          tail -30 arch/arm64/configs/vendor/ksu.config
-
-      - name: Kosongkan .scmversion (buang tanda "+")
-        run: printf '' > .scmversion
+          tail -60 arch/arm64/configs/vendor/ksu.config
 
       - name: Force build target ke a52q
         run: sed -i 's/^DO_A72Q=1/DO_A72Q=0/' ckbuild.sh
 
-      - name: Build kernel (KSU + SUSFS + KPROBE + a52q)
+      - name: Build kernel (KSU + SUSFS + KPROBES + a52q)
         run: |
           chmod +x ckbuild.sh
           bash ckbuild.sh ka52
 
-      - name: Verifikasi target HOOK-LAB di out/.config
+      # ── GERBANG MUTU: build gagal kalau ada satu saja yang meleset ────────
+      - name: Verifikasi target Kernel LAB di out/.config
         run: |
           C=out/.config
           fail=0
           check_set() { grep -qx "$1" "$C" && echo "  OK    $1" || { echo "  GAGAL $1"; fail=1; }; }
-          echo "=== harus AKTIF (root + hooking) ==="
+          # Opsi "harus mati" boleh muncul sebagai "# X is not set" ATAU tidak
+          # muncul sama sekali (dependensinya ikut mati). Salah hanya kalau =y.
+          check_off() {
+            if grep -qx "$1=y" "$C"; then
+              echo "  GAGAL $1 masih =y"; fail=1
+            elif grep -qx "# $1 is not set" "$C"; then
+              echo "  OK    $1 = n"
+            else
+              echo "  OK    $1 tidak ada di config (dependensi mati)"
+            fi
+          }
+
+          echo "=== harus AKTIF: root ==="
           check_set 'CONFIG_KSU=y'
           check_set 'CONFIG_KSU_SUSFS=y'
+          check_set 'CONFIG_KSU_SUSFS_ENABLE_LOG=y'
+
+          echo "=== harus AKTIF: permukaan hooking ==="
           check_set 'CONFIG_KPROBES=y'
+          check_set 'CONFIG_KRETPROBES=y'
           check_set 'CONFIG_KPROBE_EVENTS=y'
-          check_set 'CONFIG_FUNCTION_TRACER=y'
-          check_set 'CONFIG_DYNAMIC_FTRACE=y'
+          check_set 'CONFIG_UPROBE_EVENTS=y'
+          check_set 'CONFIG_BPF_EVENTS=y'
+          check_set 'CONFIG_TRACEPOINTS=y'
+          check_set 'CONFIG_HAVE_SYSCALL_TRACEPOINTS=y'
           check_set 'CONFIG_FTRACE_SYSCALLS=y'
           check_set 'CONFIG_DEBUG_FS=y'
-          check_set 'CONFIG_IKCONFIG_PROC=y'
           check_set 'CONFIG_KALLSYMS_ALL=y'
-          check_set 'CONFIG_KSU_SUSFS_ENABLE_LOG=y'
-          echo "=== MODULES (tidak wajib, hanya info) ==="
-          grep -E '^CONFIG_MODULES=' "$C" || echo "  (CONFIG_MODULES tidak aktif)"
-          echo "=== harus MATI (pilih manual hooks, bukan kprobe untuk KSU) ==="
-          if grep -qx 'CONFIG_KSU_KPROBES_HOOK=y' "$C"; then
-            echo "  GAGAL CONFIG_KSU_KPROBES_HOOK masih =y"; fail=1
+          check_set 'CONFIG_MODULES=y'
+          check_set 'CONFIG_MODULE_UNLOAD=y'
+          check_set 'CONFIG_IKCONFIG_PROC=y'
+
+          echo "=== harus MATI ==="
+          check_off 'CONFIG_MODULE_SIG_FORCE'        # kalau =y, insmod .ko sendiri ditolak
+          check_off 'CONFIG_FUNCTION_TRACER'         # overhead tanpa manfaat di 4.14 arm64
+          check_off 'CONFIG_KSU_KPROBES_HOOK'        # KSU tetap manual hook
+          check_off 'CONFIG_KSU_SUSFS_SUS_SU'        # bug fork sucompat.c
+          check_off 'CONFIG_SECURITY_DMESG_RESTRICT' # dmesg terbuka di kernel LAB
+
+          echo "=== LOCALVERSION ==="
+          grep '^CONFIG_LOCALVERSION=' "$C" || { echo "  GAGAL LOCALVERSION tidak ada"; fail=1; }
+          if grep -qx "CONFIG_LOCALVERSION=\"${STOCK_LOCALVERSION}\"" "$C"; then
+            echo "  OK    LOCALVERSION = ${STOCK_LOCALVERSION}"
           else
-            echo "  OK    CONFIG_KSU_KPROBES_HOOK = n"
+            echo "  GAGAL LOCALVERSION tidak tertimpa — defconfig utama menang."
+            fail=1
           fi
-          # Bug fork sucompat.c: SUS_SU=y + KPROBES_HOOK=n = undeclared execve_kp
-          if grep -qx 'CONFIG_KSU_SUSFS_SUS_SU=y' "$C"; then
-            echo "  GAGAL CONFIG_KSU_SUSFS_SUS_SU masih =y (bakal error sucompat.c)"; fail=1
-          else
-            echo "  OK    CONFIG_KSU_SUSFS_SUS_SU = n"
-          fi
-          [ "$fail" = "0" ] || { echo; echo "!!! Ada target HOOK-LAB yang meleset — build dihentikan."; exit 1; }
-          echo; echo "Semua target HOOK-LAB tercapai."
+
+          [ "$fail" = "0" ] || { echo; echo "!!! Ada target Kernel LAB yang meleset — build dihentikan."; exit 1; }
+          echo; echo "Semua target Kernel LAB tercapai."
+
+      - name: Tampilkan identitas kernel + vermagic (untuk membangun modul .ko)
+        run: |
+          echo "=== utsrelease: harus sama persis dengan vermagic modul .ko ==="
+          cat out/include/generated/utsrelease.h 2>/dev/null || echo "  (utsrelease.h tidak ditemukan)"
+          echo
+          echo "=== string versi di dalam kernel hasil build ==="
+          strings -a out/arch/arm64/boot/Image* 2>/dev/null | grep -m2 "Linux version" || \
+            echo "  (terkompresi — periksa setelah flash lewat: cat /proc/version)"
+          echo
+          echo "Membangun modul .ko untuk kernel ini: pakai tree ksu-susfs + out/.config"
+          echo "dari artefak lab-final-config, lalu:"
+          echo "  make O=out ARCH=arm64 M=/path/ke/modul modules"
 
       - name: Upload flashable zip
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ProtonPlus-KSUNext-SUSFS-KPROBE-HOOKLAB-a52q
+          name: ProtonPlus-LAB-KSUNext-SUSFS-KPROBES-a52q
           path: ProtonPlus_Resurrected_*.zip
           if-no-files-found: error
 
-      - name: Upload .config final (untuk audit)
+      # upload-artifact v4 mengabaikan dotfile secara default; tanpa
+      # include-hidden-files, out/.config tidak pernah ter-upload.
+      - name: Upload .config final (untuk audit / membangun modul)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hooklab-final-config
+          name: lab-final-config
           path: out/.config
           if-no-files-found: ignore
+          include-hidden-files: true
 
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hooklab-build-log
+          name: lab-build-log
           path: log.txt
           if-no-files-found: ignore

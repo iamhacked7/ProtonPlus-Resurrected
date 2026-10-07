@@ -1,5 +1,12 @@
-name: Build ProtonPlus + KSU-Next + SUSFS v1.5.5 — STEALTH HARDENED (a52q)
+name: Kernel HARIAN — ProtonPlus + KSU-Next + SUSFS v1.5.5, STEALTH HARDENED (a52q)
 
+# KERNEL HARIAN (stealth) — pasangan dari KERNEL LAB (setup-d.yml).
+# Keduanya dibangun dari tree dan driver yang sama; hanya defconfig yang beda.
+# Kernel ini TIDAK membawa permukaan hooking (kprobes/debugfs/modul tanpa
+# tanda tangan) supaya tidak meninggalkan sidik jari; riset hooking memakai
+# Kernel LAB. Root memakai MANUAL HOOK, satu-satunya metode yang didukung
+# resmi di kernel 4.14 (mode tracepoint/kprobes KSU hanya untuk GKI 5.10+).
+#
 # Setup C = Setup A yang terbukti boot, plus 6 pengerasan anti-deteksi.
 # Basis, driver, dan toolchain TIDAK diubah — hanya defconfig dan identitas build.
 #
@@ -138,6 +145,7 @@ jobs:
           echo "=== harus MATI ==="
           check_off 'CONFIG_IKCONFIG_PROC'
           check_off 'CONFIG_KSU_KPROBES_HOOK'
+          check_off 'CONFIG_KPROBES'          # permukaan hooking hanya di Kernel LAB
 
           echo "=== LOCALVERSION ==="
           grep '^CONFIG_LOCALVERSION=' "$C" || { echo "  GAGAL LOCALVERSION tidak ada"; fail=1; }
@@ -167,22 +175,26 @@ jobs:
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
         with:
-          name: ProtonPlus-KSUNext-SUSFS-STEALTH-a52q
+          name: ProtonPlus-HARIAN-KSUNext-SUSFS-STEALTH-a52q
           path: ProtonPlus_Resurrected_*.zip
           if-no-files-found: error
 
+      # upload-artifact v4 mengabaikan dotfile secara default; tanpa
+      # include-hidden-files, out/.config tidak pernah ter-upload (terbukti di
+      # run 23 Agu 2026: "No files were found with the provided path").
       - name: Upload .config final (untuk audit)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: final-config
+          name: harian-final-config
           path: out/.config
           if-no-files-found: ignore
+          include-hidden-files: true
 
       - name: Upload build log (untuk debugging)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
+          name: harian-build-log
           path: log.txt
           if-no-files-found: ignore
