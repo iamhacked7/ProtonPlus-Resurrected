@@ -1,0 +1,389 @@
+name: Build ProtonPlus + KSU-Next + SUSFS v1.5.5 — STEALTH ANTI-DUCK + SEQNO (a52q)
+
+# Setup E = Setup C (stealth hardened, terbukti boot) + 3 pengerasan dari hasil
+# scan Duck Detector 12 Okt 2026:
+#   7. type SELinux "ksu_file" diganti nama (kartu SELinux + LSPosed dirty policy)
+#   8. aturan "allow zygote adb_data_file:dir search" dibuang (probe DirtySepolicy)
+#   9. /proc/cmdline melaporkan bootloader terkunci ke semua pembaca KECUALI
+#      first-stage init (kartu System Properties / Custom ROM, tanpa resetprop)
+#  10. KSU tidak lagi menaikkan /sys/fs/selinux/status saat memasang sepolicy.rule
+#      modul (kartu SELinux "seqno split" karena aturan Tricky Store)
+# Isi patch = setup-e-patch.sh + setup-f-patch.sh (ditanam apa adanya di bawah).
+#
+# Nilai penyamaran diambil dari boot.emmc.win stok di TWRP backup 2026-07-18,
+# dikonfirmasi silang dengan catatan perangkat pra-root. Lihat STOCK-UNAME-a52q.md.
+
+on:
+  workflow_dispatch:
+
+env:
+  # --- identitas build stok a52q (menggantikan runner@runnervm76tkm) ---
+  KBUILD_BUILD_USER: dpi
+  KBUILD_BUILD_HOST: 21DJ6916
+  KBUILD_BUILD_TIMESTAMP: "Wed Jun 11 15:04:38 KST 2025"
+  STOCK_LOCALVERSION: "-perf-28693687-abA525FXXSCFYF1"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04   # 22.04 punya libtinfo5 yang dibutuhkan ckbuild.sh
+    steps:
+      - name: Checkout kernel source (branch ksu-susfs)
+        uses: actions/checkout@v4
+        with:
+          repository: notfleshka/ProtonPlus-Resurrected
+          ref: ksu-susfs
+          fetch-depth: 1
+
+      - name: Pasang driver KSU-Next + SUSFS v1.5.5 (yang cocok dgn tree ini)
+        run: |
+          rm -rf KernelSU-Next
+          git clone -b next-v1.5.5 https://github.com/notfleshka/KernelSU-Next-susfs KernelSU-Next
+          echo "drivers/kernelsu -> $(readlink drivers/kernelsu)"
+          echo "cek SUSFS di driver (harus > 0):"; grep -c "SUSFS" KernelSU-Next/kernel/Kconfig
+          echo "version code:"; git -C KernelSU-Next rev-list --count HEAD
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
+
+      # ── PENGERASAN 1: hilangkan tanda "+" dari uname ──────────────────────
+      # scripts/setlocalversion menambahkan "+" saat pohon git tanpa tag.
+      # Berkas .scmversion kosong membuatnya tidak menambahkan apa pun.
+      - name: Kosongkan .scmversion (buang tanda "+")
+        run: |
+          printf '' > .scmversion
+          echo "  .scmversion dibuat kosong"
+
+      # ── PENGERASAN 2-6: defconfig ─────────────────────────────────────────
+      - name: Aktifkan KSU + SUSFS + pengerasan anti-deteksi
+        run: |
+          cat >> arch/arm64/configs/vendor/ksu.config <<EOF
+          CONFIG_KSU=y
+          # CONFIG_KSU_KPROBES_HOOK is not set
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+
+          # --- HARUS =y, JANGAN dimatikan ---
+          # Percobaan build 23 Agu 2026 dengan =n GAGAL saat link:
+          #   ld.lld: error: undefined symbol: susfs_is_log_enabled
+          #   referenced by core_hook.c:1077 (ksu_try_umount, susfs_try_umount_all)
+          # Sebabnya bug penjagaan #ifdef di fork ini: pemanggil di core_hook.c:1077
+          # dijaga CONFIG_KSU_SUSFS_TRY_UMOUNT, bukan CONFIG_KSU_SUSFS_ENABLE_LOG.
+          # Karena TRY_UMOUNT=y, pemanggilnya ikut ter-compile sementara
+          # variabelnya hilang. Membiarkan =y adalah satu-satunya pilihan aman.
+          #
+          # Kebocoran dmesg TETAP tertutup lewat dua lapis lain:
+          #   1. CONFIG_SECURITY_DMESG_RESTRICT=y di bawah -> aplikasi tidak bisa
+          #      membaca dmesg sama sekali, apa pun isinya (sisi pembaca)
+          #   2. susfs_log=0 di /data/adb/susfs4ksu/config.sh -> pesannya tidak
+          #      ditulis sejak awal (sisi penulis)
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+
+          # --- BARU: tutup /proc/config.gz ---
+          # Setup A mengeksposnya berisi 17 baris CONFIG_KSU*.
+          # Kernel stok Samsung tidak punya berkas ini sama sekali.
+          # CONFIG_IKCONFIG_PROC is not set
+
+          # --- BARU: tutup dmesg dari aplikasi ---
+          # Android user build normalnya memang begini.
+          CONFIG_SECURITY_DMESG_RESTRICT=y
+
+          # --- BARU: samarkan nama kernel jadi stok ---
+          CONFIG_LOCALVERSION="${STOCK_LOCALVERSION}"
+          # CONFIG_LOCALVERSION_AUTO is not set
+          EOF
+          echo "=== ksu.config final ==="
+          tail -25 arch/arm64/configs/vendor/ksu.config
+
+      # ── PENGERASAN 7-9: SELinux KSU + /proc/cmdline (lihat setup-e-patch.sh) ──
+      - name: Terapkan patch SETUP-E (SELinux KSU + /proc/cmdline)
+        env:
+          KSU_FILE_TYPE: vendor_tty_aux_file
+        run: |
+          bash <<'SETUPE'
+          #!/usr/bin/env bash
+          # SETUP-E: tiga pengerasan anti-deteksi di atas SETUP-C, dari hasil scan
+          # Duck Detector 12 Okt 2026. Dijalankan dari root tree kernel ProtonPlus,
+          # SETELAH KernelSU-Next (next-v1.5.5) di-clone ke ./KernelSU-Next.
+          #
+          # Sumber tunggal: workflow SETUP-E-stealth-antiduck.yml menanam isi berkas ini
+          # apa adanya, jadi build lokal dan build GitHub Actions memakai patch yang sama.
+          set -euo pipefail
+
+          KSU_FILE_TYPE="${KSU_FILE_TYPE:-vendor_tty_aux_file}"
+          SEL=KernelSU-Next/kernel/selinux
+
+          # ── PENGERASAN 7: ganti nama type SELinux "ksu_file" ─────────────────────────
+          # KSU-Next membuat type ksu_file + "allow ALL ksu_file ALL ALL". Dari app_zygote,
+          # aplikasi biasa bisa membuktikannya: /sys/fs/selinux/context menerima
+          # u:object_r:ksu_file:s0, /proc/self/attr/current memberi EPERM (bukan EINVAL),
+          # dan selinux_check_access untrusted_app -> ksu_file:file read = allowed.
+          # Detector hanya menguji nama yang sudah dikenal, jadi type diberi nama yang tidak
+          # ada di policy stok (dicek di HP: konteksnya ditolak EINVAL). Nama ini cuma
+          # dipakai di rules.c dan selinux.c (label devpts); ksud tidak memakainya.
+          sed -i "s/^#define KERNEL_SU_FILE \"ksu_file\"$/#define KERNEL_SU_FILE \"${KSU_FILE_TYPE}\"/" "$SEL/rules.c"
+          sed -i "s/^#define DEVPTS_DOMAIN \"u:object_r:ksu_file:s0\"$/#define DEVPTS_DOMAIN \"u:object_r:${KSU_FILE_TYPE}:s0\"/" "$SEL/selinux.c"
+
+          # ── PENGERASAN 8: buang "allow zygote adb_data_file:dir search" ──────────────
+          # Probe DirtySepolicy menanyakan aturan ini (stok: denied). Pemakainya cuma umount
+          # /data/adb/modules dari konteks zygote, yang hanya perlu untuk modul berbasis loop
+          # image; mount KSU bawaan sudah disembunyikan SUSFS
+          # (CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y).
+          sed -i '/we need to umount modules in zygote/d; /ksu_allow(db, "zygote", "adb_data_file", "dir", "search");/d' "$SEL/rules.c"
+
+          # ── PENGERASAN 9: /proc/cmdline melaporkan bootloader terkunci ───────────────
+          # init (second stage) membaca /proc/cmdline untuk mengisi ro.boot.*, jadi nilai
+          # "locked" terisi native sejak boot tanpa resetprop. ro.boot.flash.locked ikut
+          # diturunkan init dari verifiedbootstate, ro.vendor.boot.warranty_bit disalin
+          # oleh init.rilcommon.rc.
+          #
+          # PENTING: first-stage init TIDAK boleh ikut dibohongi. libfs_avb memakai
+          # verifiedbootstate == "orange" untuk mengizinkan vbmeta yang sudah di-disable
+          # (AvbHandle::Open -> allow_verification_error); kalau ia melihat "green",
+          # mount system gagal dan HP bootloop. First stage berjalan sebelum policy SELinux
+          # dimuat, dengan SID awal "kernel", jadi pembaca ber-SID itu diberi nilai asli.
+          cat > fs/proc/cmdline.c <<'EOF'
+          // SPDX-License-Identifier: GPL-2.0
+          #include <linux/fs.h>
+          #include <linux/init.h>
+          #include <linux/proc_fs.h>
+          #include <linux/security.h>
+          #include <linux/seq_file.h>
+          #include <linux/string.h>
+          #include <asm/setup.h>
+
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          extern int susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);
+          #endif
+
+          /* SECINITSID_KERNEL: SID semua task sebelum policy SELinux dimuat. */
+          #define KERNEL_INITIAL_SID 1
+
+          /* Salinan cmdline dengan status bootloader "locked"; saved_command_line asli
+           * tidak disentuh, jadi driver kernel tetap melihat nilai dari bootloader. */
+          static char locked_command_line[COMMAND_LINE_SIZE];
+
+          static void __init cmdline_set_flag(char *cmd, const char *flag, const char *val)
+          {
+          	size_t flag_len = strlen(flag), val_len = strlen(val);
+          	char *pos = cmd;
+
+          	while ((pos = strstr(pos, flag))) {
+          		char *start = pos + flag_len;
+          		char *end = start + strcspn(start, " ");
+
+          		if (strlen(cmd) - (end - start) + val_len >= COMMAND_LINE_SIZE)
+          			return;
+
+          		memmove(start + val_len, end, strlen(end) + 1);
+          		memcpy(start, val, val_len);
+          		pos = start + val_len;
+          	}
+          }
+
+          /* first-stage init (dan selinux_setup) butuh nilai asli untuk keputusan AVB. */
+          static bool cmdline_reader_is_early_init(void)
+          {
+          #ifdef CONFIG_SECURITY_SELINUX
+          	u32 sid = 0;
+
+          	security_task_getsecid(current, &sid);
+          	return sid == KERNEL_INITIAL_SID;
+          #else
+          	return true;
+          #endif
+          }
+
+          static int cmdline_proc_show(struct seq_file *m, void *v)
+          {
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          	if (!susfs_spoof_cmdline_or_bootconfig(m)) {
+          		seq_putc(m, '\n');
+          		return 0;
+          	}
+          #endif
+          	if (cmdline_reader_is_early_init())
+          		seq_printf(m, "%s\n", saved_command_line);
+          	else
+          		seq_printf(m, "%s\n", locked_command_line);
+          	return 0;
+          }
+
+          static int cmdline_proc_open(struct inode *inode, struct file *file)
+          {
+          	return single_open(file, cmdline_proc_show, NULL);
+          }
+
+          static const struct file_operations cmdline_proc_fops = {
+          	.open		= cmdline_proc_open,
+          	.read		= seq_read,
+          	.llseek		= seq_lseek,
+          	.release	= single_release,
+          };
+
+          static int __init proc_cmdline_init(void)
+          {
+          	strlcpy(locked_command_line, saved_command_line, sizeof(locked_command_line));
+          	cmdline_set_flag(locked_command_line, "androidboot.verifiedbootstate=", "green");
+          	cmdline_set_flag(locked_command_line, "androidboot.flash.locked=", "1");
+          	cmdline_set_flag(locked_command_line, "androidboot.vbmeta.device_state=", "locked");
+          	cmdline_set_flag(locked_command_line, "androidboot.warranty_bit=", "0");
+          	proc_create("cmdline", 0, NULL, &cmdline_proc_fops);
+          	return 0;
+          }
+          fs_initcall(proc_cmdline_init);
+          EOF
+
+          # ── Gerbang mutu: gagal kalau ada patch yang tidak kena ──────────────────────
+          fail=0
+          check() { if eval "$2"; then echo "  OK    $1"; else echo "  GAGAL $1"; fail=1; fi; }
+          check "KERNEL_SU_FILE = ${KSU_FILE_TYPE}" "grep -qx '#define KERNEL_SU_FILE \"${KSU_FILE_TYPE}\"' $SEL/rules.c"
+          check "DEVPTS_DOMAIN = ${KSU_FILE_TYPE}"  "grep -qx '#define DEVPTS_DOMAIN \"u:object_r:${KSU_FILE_TYPE}:s0\"' $SEL/selinux.c"
+          check "tidak ada sisa 'ksu_file'"         "! grep -rq 'ksu_file' KernelSU-Next/kernel"
+          check "aturan zygote adb_data_file hilang" "! grep -q '\"zygote\", \"adb_data_file\"' $SEL/rules.c"
+          check "cmdline.c ber-gate SID kernel"     "grep -q cmdline_reader_is_early_init fs/proc/cmdline.c"
+          [ "$fail" = "0" ] || { echo "!!! Patch SETUP-E tidak lengkap — build dihentikan."; exit 1; }
+          echo "Patch SETUP-E terpasang."
+          SETUPE
+
+      # ── PENGERASAN 10: tanpa "seqno split" (lihat setup-f-patch.sh) ──
+      - name: Terapkan patch SETUP-F (status page SELinux)
+        run: |
+          bash <<'SETUPF'
+          #!/usr/bin/env bash
+          # SETUP-F: satu pengerasan di atas SETUP-E, dari scan Duck Detector 12 Okt 2026
+          # setelah setup hiding (Tricky Store). Dijalankan dari root tree kernel ProtonPlus,
+          # SETELAH setup-e-patch.sh.
+          #
+          # Sumber tunggal: workflow SETUP-F-stealth-seqno.yml menanam isi berkas ini apa adanya.
+          set -euo pipefail
+
+          SEL=KernelSU-Next/kernel/selinux
+
+          # ── PENGERASAN 10: jangan sentuh selinux status page saat KSU menambah aturan ──
+          # ksud memasang sepolicy.rule modul (mis. Tricky Store: crash_dump -> keystore) secara
+          # live setelah boot. reset_avc_cache() lalu memanggil selinux_status_update_policyload(0):
+          # "sequence" di /sys/fs/selinux/status naik 2 per aturan, sementara "policyload" tetap 0.
+          # Kombinasi itu tidak pernah terjadi di policy stok, dan Duck Detector membacanya dari
+          # app_zygote sebagai "seqno split" (kartu SELinux merah).
+          #
+          # avc_ss_reset() dan selnl_notify_policyload() tetap dipanggil, jadi aturan baru langsung
+          # berlaku untuk semua izin yang diperiksa kernel. Yang tidak lagi diberi tahu hanya cache
+          # AVC userspace (servicemanager, property service): aman selama aturan modul hanya
+          # menyentuh kelas kernel, seperti aturan Tricky Store.
+          sed -i '/^[[:space:]]*selinux_status_update_policyload(/d' "$SEL/rules.c"
+
+          # ── Gerbang mutu ─────────────────────────────────────────────────────────────
+          fail=0
+          if grep -q "selinux_status_update_policyload" "$SEL/rules.c"; then
+            echo "  GAGAL selinux_status_update_policyload masih dipanggil"; fail=1
+          else
+            echo "  OK    reset_avc_cache() tidak lagi menyentuh selinux status page"
+          fi
+          if [ "$(grep -c 'avc_ss_reset(' "$SEL/rules.c")" -ge 2 ]; then
+            echo "  OK    avc_ss_reset() tetap ada di kedua cabang"
+          else
+            echo "  GAGAL avc_ss_reset() ikut hilang"; fail=1
+          fi
+          [ "$fail" = "0" ] || { echo "!!! Patch SETUP-F tidak lengkap — build dihentikan."; exit 1; }
+          echo "Patch SETUP-F terpasang."
+          SETUPF
+
+      - name: Force build target ke a52q
+        run: sed -i 's/^DO_A72Q=1/DO_A72Q=0/' ckbuild.sh
+
+      - name: Build kernel (KSU + a52q)
+        run: |
+          chmod +x ckbuild.sh
+          bash ckbuild.sh ka52
+
+      # ── GERBANG MUTU: build gagal kalau ada satu saja yang meleset ────────
+      - name: Verifikasi target pengerasan di out/.config
+        run: |
+          C=out/.config
+          fail=0
+          check_set() { grep -qx "$1" "$C" && echo "  OK    $1" || { echo "  GAGAL $1"; fail=1; }; }
+          # Opsi "harus mati" bisa muncul sebagai "# X is not set" ATAU tidak muncul
+          # sama sekali (kalau dependensinya ikut mati). Keduanya benar — yang salah
+          # hanya kalau ia benar-benar =y.
+          check_off() {
+            if grep -qx "$1=y" "$C"; then
+              echo "  GAGAL $1 masih =y"; fail=1
+            elif grep -qx "# $1 is not set" "$C"; then
+              echo "  OK    $1 = n"
+            else
+              echo "  OK    $1 tidak ada di config (dependensi mati)"
+            fi
+          }
+
+          echo "=== harus AKTIF ==="
+          check_set 'CONFIG_KSU=y'
+          check_set 'CONFIG_KSU_SUSFS=y'
+          check_set 'CONFIG_KSU_SUSFS_SPOOF_UNAME=y'
+          check_set 'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y'
+          check_set 'CONFIG_SECURITY_DMESG_RESTRICT=y'
+          check_set 'CONFIG_KALLSYMS_ALL=y'
+          check_set 'CONFIG_KSU_SUSFS_ENABLE_LOG=y'   # wajib =y, lihat catatan di atas
+
+          echo "=== harus MATI ==="
+          check_off 'CONFIG_IKCONFIG_PROC'
+          check_off 'CONFIG_KSU_KPROBES_HOOK'
+
+          echo "=== LOCALVERSION ==="
+          grep '^CONFIG_LOCALVERSION=' "$C" || { echo "  GAGAL LOCALVERSION tidak ada"; fail=1; }
+          if grep -qx "CONFIG_LOCALVERSION=\"${STOCK_LOCALVERSION}\"" "$C"; then
+            echo "  OK    LOCALVERSION = ${STOCK_LOCALVERSION}"
+          else
+            echo "  GAGAL LOCALVERSION tidak tertimpa — defconfig utama menang."
+            echo "        Perbaiki dengan sed langsung ke arch/arm64/configs/<defconfig>."
+            fail=1
+          fi
+
+          [ "$fail" = "0" ] || { echo; echo "!!! Ada target pengerasan yang meleset — build dihentikan."; exit 1; }
+          echo; echo "Semua target pengerasan tercapai."
+
+      - name: Tampilkan identitas kernel hasil build
+        run: |
+          echo "=== string versi di dalam kernel hasil build ==="
+          strings -a out/arch/arm64/boot/Image* 2>/dev/null | grep -m2 "Linux version" || \
+            echo "  (terkompresi — periksa setelah flash lewat: cat /proc/version)"
+          echo
+          echo "Target yang diharapkan setelah flash:"
+          echo "  4.14.190${STOCK_LOCALVERSION} (${KBUILD_BUILD_USER}@${KBUILD_BUILD_HOST}) ... ${KBUILD_BUILD_TIMESTAMP}"
+          echo
+          echo "Stok asli sebagai pembanding:"
+          echo "  4.14.190-perf-28693687-abA525FXXSCFYF1 (dpi@21DJ6916) (clang 10.0.7 ...) #1 SMP PREEMPT Wed Jun 11 15:04:38 KST 2025"
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProtonPlus-KSUNext-SUSFS-STEALTH-F-a52q
+          path: ProtonPlus_Resurrected_*.zip
+          if-no-files-found: error
+
+      - name: Upload .config final (untuk audit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-config
+          path: out/.config
+          if-no-files-found: ignore
+
+      - name: Upload build log (untuk debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: log.txt
+          if-no-files-found: ignore
