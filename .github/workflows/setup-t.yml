@@ -1,10 +1,12 @@
 name: Build ProtonPlus + BakaSU — LAB TRACE + TracerPid spoof (a52q) [SETUP-T]
 
 # SETUP-T = SETUP-K (LAB trace, NoMount off) + patch TracerPid.
-# Garuda 5.0.1 memeriksa /proc/self/status dan /proc/self/task/<tid>/status.
-# Patch: task dengan comm mengandung "kikyps" selalu melaporkan TracerPid 0,
-# supaya hardware breakpoint (tanpa patch kode) bisa dipakai menangkap
-# x0/x1 asli di dekriptor libkikypspro+0x1202804.
+# fs/proc/array.c (tree 4.14) menghitung TracerPid:
+#   tracer = ptrace_parent(p); if (tracer) tpid = task_pid_nr_ns(tracer, ns);
+# Patch menambah: kalau comm task mengandung "kikyps", tpid = 0.
+# Kena ke /proc/<pid>/status dan /proc/self/task/<tid>/status sekaligus.
+# Tujuan: hardware breakpoint di dekriptor libkikypspro+0x1202804 tidak
+# terlihat anti-debug, jadi x0/x1 asli bisa ditangkap tanpa patch kode.
 
 # SETUP-K = SETUP-J (BakaSU manual hook + trace) TANPA NoMount.
 #
@@ -450,16 +452,15 @@ jobs:
           s = open(p).read()
           if 'KSU_TRACERPID_SPOOF' in s:
               print('sudah dipatch'); sys.exit(0)
-          if '#include <linux/string.h>' not in s:
-              s = s.replace('#include <linux/sched.h>', '#include <linux/sched.h>\n#include <linux/string.h>', 1)
-          old = 'task_tracer_pid(task)'
+          old = "\ttracer = ptrace_parent(p);\n\tif (tracer)\n\t\ttpid = task_pid_nr_ns(tracer, ns);\n"
           if old not in s:
-              print('!!! pola tidak ada'); sys.exit(1)
-          s = s.replace(old, '/* KSU_TRACERPID_SPOOF */ (strstr(task->comm, "kikyps") ? 0 : task_tracer_pid(task))')
+              print('!!! pola tracer tidak ada'); sys.exit(1)
+          ins = old + "\t/* KSU_TRACERPID_SPOOF */\n\tif (strstr(p->comm, \"kikyps\"))\n\t\ttpid = 0;\n"
+          s = s.replace(old, ins, 1)
           open(p, 'w').write(s)
           print('patch ok')
           PYEOF
-          grep -n KSU_TRACERPID_SPOOF "$F" | head -3
+          grep -n KSU_TRACERPID_SPOOF "$F" | head -5
           grep -q KSU_TRACERPID_SPOOF "$F" || { echo '!!! patch gagal'; exit 1; }
 
       - name: Aktifkan permukaan tracing (LAB — SETUP-J)
