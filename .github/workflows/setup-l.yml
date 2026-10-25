@@ -1,0 +1,634 @@
+name: Build ProtonPlus + BakaSU — LAB ksu_file lockdown (a52q) [SETUP-L]
+
+# SETUP-L = SETUP-K + satu perbaikan SELinux.
+#
+# Temuan: policy kernel ini berisi
+#   allow domain ksu_file:file { ... read ... }
+# dari BakaSU/kernel/selinux/rules.c (ksu_allow(db, "domain", KERNEL_SU_FILE, ALL, ALL)).
+# Efeknya SEMUA domain, termasuk untrusted_app, boleh baca ksu_file. RASP Garuda
+# Defender punya probe persis itu di tabel string-nya:
+#   "u:r:untrusted_app:s0 u:object_r:ksu_file:s0 file read"
+# dan selcheck membuktikan hasilnya ALLOWED di device ini.
+#
+# Perbaikan: rule dibatasi ke domain ksu saja. Domain ksu sudah punya "allow all",
+# jadi root/ksud/modul tidak terpengaruh; app biasa tidak lagi bisa menyentuh ksu_file.
+# Uji A/B: kalau "Root: Yes" hilang, probe SELinux itu pemicunya.
+
+# SETUP-K = SETUP-J (BakaSU manual hook + trace) TANPA NoMount.
+#
+# Alasan: dari bedah RASP Garuda Defender 5.0.1, app punya check
+# "detectMetamoduleVfs" yang secara eksplisit menstat /sys/module/nomount.
+# Di device, path itu KELIHATAN dari konteks app (stat sukses) walaupun isinya
+# tidak bisa dibaca. NoMount = metamodule, jadi ini tersangka utama "Root: Yes".
+#
+# SETUP-K mematikan CONFIG_NOMOUNT supaya /sys/module/nomount hilang sama sekali,
+# sehingga kita bisa A/B: kalau verdict berubah, terbukti NoMount yang bocor.
+# Konsekuensi: file modul tidak lagi disembunyikan lewat VFS redirect NoMount.
+# Kernel ini untuk UJI, bukan daily.
+
+# SETUP-J = SETUP-I (BakaSU manual hook + NoMount + sidhash, STEALTH) TANPA perubahan
+# pada root/hiding, hanya DITAMBAH permukaan tracing:
+#   ftrace function tracer, events/syscalls, kprobe_events, uprobe_events, fanotify.
+#
+# Tujuan: bisa MELIHAT apa yang dibaca/dicek RASP (Garuda Defender 5.0.1) dari sisi
+# kernel, tanpa ptrace/Frida yang langsung dibunuh app.
+# Pakai kernel ini HANYA untuk lab. Setelah selesai, flash balik SETUP-I.
+#
+# Setelah boot:
+#   su -c 'sysctl -w kernel.kptr_restrict=0'
+#   su -c 'mount -t debugfs none /sys/kernel/debug'
+#   sh /data/local/tmp/trace_rasp.sh
+
+# Setup I = SETUP-H + perbaikan "SID ganda" di selinux_hide (BakaSU upstream d7260ca1, #623).
+#   gejala H : aplikasi tidak bisa exec apa pun (getprop/sh/toybox/run-as):
+#              avc: denied { transition } untrusted_app -> untrusted_app (konteks sama, SID beda)
+#   sebab    : hook setprocattr selinux_hide memasukkan konteks ke sidtab tanpa context_add_hash,
+#              padahal tree 4.14 ini memakai sidtab ber-hash (backport Google)
+#   fix      : cherry-pick -n (tanpa commit) -> HEAD BakaSU tetap f4435f00, version code tetap
+#              35227, UAPI tetap 4: manager (com.lumen.toolbox) & ksud rc3 di HP tidak diganti
+# Selebihnya identik dengan SETUP-H (uname stok, IKCONFIG mati, dmesg restrict, cmdline "locked"
+# untuk init, status SELinux tidak dinaikkan, NoMount built-in).
+# Isi patch = setup-h-patch.sh + setup-i-patch.sh + setup-g-patch.sh (ditanam apa adanya).
+#
+# Nilai penyamaran diambil dari boot.emmc.win stok di TWRP backup 2026-07-18,
+# dikonfirmasi silang dengan catatan perangkat pra-root. Lihat STOCK-UNAME-a52q.md.
+
+on:
+  workflow_dispatch:
+
+env:
+  # --- identitas build stok a52q (menggantikan runner@runnervm76tkm) ---
+  KBUILD_BUILD_USER: dpi
+  KBUILD_BUILD_HOST: 21DJ6916
+  KBUILD_BUILD_TIMESTAMP: "Wed Jun 11 15:04:38 KST 2025"
+  STOCK_LOCALVERSION: "-perf-28693687-abA525FXXSCFYF1"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04   # 22.04 punya libtinfo5 yang dibutuhkan ckbuild.sh
+    steps:
+      # Commit dikunci: patch H mencocokkan blok hook KSU-Next di tree ini secara persis.
+      - name: Checkout kernel source (ProtonPlus ksu-susfs @2cc88ea)
+        uses: actions/checkout@v4
+        with:
+          repository: notfleshka/ProtonPlus-Resurrected
+          ref: 2cc88ea06dd3be9f5a936518fd06c5fece7a55aa
+          fetch-depth: 1
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
+
+      # ── PENGERASAN 1: hilangkan tanda "+" dari uname ──────────────────────
+      - name: Kosongkan .scmversion (buang tanda "+")
+        run: |
+          printf '' > .scmversion
+          echo "  .scmversion dibuat kosong"
+
+      # ── PENGERASAN 2-6: defconfig (opsi KSU diatur oleh patch SETUP-H) ────
+      - name: Pengerasan defconfig (tanpa SUSFS)
+        run: |
+          cat >> arch/arm64/configs/vendor/ksu.config <<EOF
+
+          # --- tutup /proc/config.gz (kernel stok Samsung tidak punya) ---
+          # CONFIG_IKCONFIG_PROC is not set
+
+          # --- tutup dmesg dari aplikasi (Android user build normalnya begini) ---
+          CONFIG_SECURITY_DMESG_RESTRICT=y
+
+          # --- samarkan nama kernel jadi stok ---
+          CONFIG_LOCALVERSION="${STOCK_LOCALVERSION}"
+          # CONFIG_LOCALVERSION_AUTO is not set
+          EOF
+
+      # ── PENGERASAN 9-10 + core BakaSU (lihat setup-h-patch.sh) ──
+      - name: Terapkan patch SETUP-H (BakaSU manual hook + cmdline + status SELinux)
+        run: |
+          bash <<'SETUPH'
+          #!/usr/bin/env bash
+          # SETUP-H: core root diganti dari KernelSU-Next 1.x + SUSFS ke BakaSU (mode manual hook).
+          # Dijalankan dari root tree kernel ProtonPlus (branch ksu-susfs), lalu disusul
+          # setup-g-patch.sh (NoMount). Patch SETUP-E #7/#8 dan setup-f-patch.sh tidak dipakai lagi
+          # karena menyunting file KernelSU-Next; padanannya untuk BakaSU ada di bawah.
+          #
+          # Sumber tunggal: workflow SETUP-H-bakasu.yml menanam isi berkas ini apa adanya.
+          set -euo pipefail
+
+          BAKASU_URL="${BAKASU_URL:-https://github.com/Baka-SU/BakaSU}"
+          # main 13 Okt 2026 (sesudah v4.2.0-rc3): sudah membawa perbaikan selinux_hide untuk kernel
+          # lama (sidtab detection, time side-channel) dan scan manager tanpa fsnotify (throne hunt).
+          # Kbuild BakaSU wajib git clone lengkap: version code = 30000 + jumlah commit + 700 = 35227.
+          BAKASU_REF="${BAKASU_REF:-f4435f007b16f61705089ff982e3f981a6017979}"
+          # Manager yang dipasang di HP: v4.2.0-rc3 (35171) ber-UAPI 4. ksud menolak menjalankan
+          # post-fs-data/service/boot-completed (modul seperti Tricky Store) kalau UAPI kernel beda
+          # dengan UAPI ksud, jadi angka UAPI kernel disamakan. Satu-satunya perubahan UAPI sesudah
+          # rc3 adalah EVENT_SERVICES, event opsional yang tidak dikirim ksud rc3.
+          MANAGER_UAPI="${MANAGER_UAPI:-4}"
+
+          # ── 1. BakaSU sebagai drivers/kernelsu ────────────────────────────────────────
+          rm -rf KernelSU-Next BakaSU
+          git clone -q "$BAKASU_URL" BakaSU
+          git -C BakaSU checkout -q "$BAKASU_REF"
+          ln -sfn ../BakaSU/kernel drivers/kernelsu
+
+          # ── 2. Penyesuaian di sisi BakaSU ─────────────────────────────────────────────
+          # PENGERASAN 10 (padanan SETUP-F): memasang aturan SELinux (bawaan KSU + sepolicy.rule
+          # modul) tidak menaikkan /sys/fs/selinux/status. Kalau dinaikkan, aplikasi melihat
+          # sequence>0 dengan policyload=0 ("seqno split") selama selinux_hide belum aktif.
+          sed -i '/^[[:space:]]*selinux_status_update_policyload(/d' BakaSU/kernel/selinux/rules.c
+          sed -i "s/^static const __u32 KERNEL_SU_UAPI_VERSION = [0-9]*;\$/static const __u32 KERNEL_SU_UAPI_VERSION = ${MANAGER_UAPI};/" \
+              BakaSU/uapi/supercall.h
+
+          # ── 3. Hook manual sesuai bakasu.org/guide/manual-integrate (dicek ulang Kbuild) ──
+          # - exec: pola do_execve/compat_do_execve (dipakai ProtonPlus sejak awal; dokumen BakaSU
+          #   hanya melarangnya untuk Android 17 QPR2+). Tanpa hook post-execve di fs/exec.c,
+          #   BakaSU otomatis memakai LSM bprm_committed_creds — menghindari baca struct filename
+          #   yang sudah di-putname oleh do_execveat_common.
+          # - stat: tambah hook nilai balik newfstat/fstat64 (ukuran init.rc saat injeksi rc ksud).
+          # - read & input: hook manual KSU-Next dibuang; BakaSU memakai LSM file_permission dan
+          #   input_handler (ksu_vfs_read_hook bahkan ditolak Kbuild BakaSU).
+          # - reboot: jalur supercall BakaSU (fd driver). Aplikasi biasa tetap kena seccomp reboot.
+          # - faccessat, newfstatat/fstatat64, devpts (stub di BakaSU) dan hack transisi nosuid di
+          #   selinux/hooks.c dibiarkan: tanda tangannya cocok.
+          python3 - <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+
+          def edit(path, pattern, repl, count=1):
+              p = Path(path)
+              text = p.read_text()
+              new, n = re.subn(pattern, repl, text, flags=re.S)
+              if n != count:
+                  sys.exit(f"!!! {path}: pola ketemu {n}x, harus {count}x:\n{pattern}")
+              p.write_text(new)
+
+
+          EXEC_DECL = """#ifdef CONFIG_KSU_MANUAL_HOOK
+          __attribute__((hot))
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+          				void *argv, void *envp, int *flags);
+          #endif
+          """
+          EXEC_CALL = """#ifdef CONFIG_KSU_MANUAL_HOOK%s
+          	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+          #endif
+          """
+          edit("fs/exec.c", r"#ifdef CONFIG_KSU\nextern bool ksu_execveat_hook __read_mostly;\n.*?#endif\n",
+               lambda m: EXEC_DECL)
+          edit("fs/exec.c", r"#ifdef CONFIG_KSU\n\tif \(unlikely\(ksu_execveat_hook\)\)\n.*?#endif\n",
+               lambda m: EXEC_CALL % "")
+          edit("fs/exec.c", r"#ifdef CONFIG_KSU\n\tif \(!ksu_execveat_hook\)\n.*?#endif\n",
+               lambda m: EXEC_CALL % " /* ksud 32-bit dan su 32-on-64 */")
+
+          edit("fs/stat.c",
+               r"(#ifdef CONFIG_KSU\nextern int ksu_handle_stat\(int \*dfd, const char __user \*\*filename_user, int \*flags\);\n)(#endif\n)",
+               lambda m: m.group(1) + m.group(2) + """
+          #ifdef CONFIG_KSU_MANUAL_HOOK
+          extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
+          #if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
+          extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);
+          #endif
+          #endif
+          """)
+          edit("fs/stat.c",
+               r"((?<!COMPAT_)SYSCALL_DEFINE2\(newfstat, unsigned int, fd, struct stat __user \*, statbuf\)\n\{\n(?:(?!\n\}).)*?\n)(\treturn error;\n\})",
+               lambda m: m.group(1) + "#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif\n" + m.group(2))
+          edit("fs/stat.c",
+               r"(SYSCALL_DEFINE2\(fstat64, unsigned long, fd, struct stat64 __user \*, statbuf\)\n\{\n(?:(?!\n\}).)*?\n)(\treturn error;\n\})",
+               lambda m: m.group(1) + "#ifdef CONFIG_KSU_MANUAL_HOOK /* 32-bit */\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif\n" + m.group(2))
+
+          edit("fs/read_write.c", r"#ifdef CONFIG_KSU\nextern bool ksu_vfs_read_hook __read_mostly;\n.*?#endif\n\n?", "")
+          edit("fs/read_write.c", r"#ifdef CONFIG_KSU\n\t\tif \(unlikely\(ksu_vfs_read_hook\)\)[ \t]*\n[^\n]*ksu_handle_sys_read[^\n]*\n#endif\n", "")
+
+          edit("drivers/input/input.c", r"#ifdef CONFIG_KSU\nextern bool ksu_input_hook __read_mostly;\n.*?#endif\n\n?", "")
+          edit("drivers/input/input.c", r"#ifdef CONFIG_KSU\n\tif \(unlikely\(ksu_input_hook\)\)\n[^\n]*ksu_handle_input_handle_event[^\n]*\n#endif\n\n?", "")
+
+          edit("kernel/reboot.c",
+               r"(SYSCALL_DEFINE4\(reboot, int, magic1, int, magic2, unsigned int, cmd,\n\s*void __user \*, arg\)\n\{\n(?:(?!\n\}).)*?\tint ret = 0;\n)",
+               lambda m: """#ifdef CONFIG_KSU_MANUAL_HOOK
+          extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
+          #endif
+
+          """ + m.group(1) + """
+          #ifdef CONFIG_KSU_MANUAL_HOOK
+          	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+          #endif
+          """)
+          print("hook manual BakaSU terpasang")
+          PY
+
+          # ── 4. Konfigurasi KSU (fragmen ksu.config) ──────────────────────────────────
+          # Buang semua opsi KSU-Next/SUSFS bawaan tree; SUSFS di BakaSU adalah pilihan "hook method"
+          # yang sedang dikunci upstream, jadi kode SUSFS di tree ikut tidak dikompilasi.
+          KCFG=arch/arm64/configs/vendor/ksu.config
+          sed -i '/CONFIG_KSU/d' "$KCFG"
+          cat >> "$KCFG" <<'EOF'
+
+          # BakaSU, manual hook (SETUP-H)
+          CONFIG_KSU=y
+          CONFIG_KSU_MANUAL_HOOK=y
+          # CONFIG_KSU_TRACEPOINT_HOOK is not set
+          # CONFIG_KSU_SUSFS is not set
+          CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
+          CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y
+          CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
+          # CONFIG_KSU_DEBUG is not set
+          # CONFIG_KSU_TOOLKIT_SUPPORT is not set
+          EOF
+
+          # ── PENGERASAN 9: /proc/cmdline melaporkan bootloader terkunci ───────────────
+          # Sama persis dengan SETUP-E. init (second stage) membaca /proc/cmdline untuk mengisi
+          # ro.boot.*, jadi nilai "locked" terisi native sejak boot tanpa resetprop.
+          # First-stage init (SID awal "kernel") tetap diberi nilai asli: libfs_avb memakai
+          # verifiedbootstate == "orange" untuk mengizinkan vbmeta yang sudah di-disable.
+          cat > fs/proc/cmdline.c <<'EOF'
+          // SPDX-License-Identifier: GPL-2.0
+          #include <linux/fs.h>
+          #include <linux/init.h>
+          #include <linux/proc_fs.h>
+          #include <linux/security.h>
+          #include <linux/seq_file.h>
+          #include <linux/string.h>
+          #include <asm/setup.h>
+
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          extern int susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);
+          #endif
+
+          /* SECINITSID_KERNEL: SID semua task sebelum policy SELinux dimuat. */
+          #define KERNEL_INITIAL_SID 1
+
+          /* Salinan cmdline dengan status bootloader "locked"; saved_command_line asli
+           * tidak disentuh, jadi driver kernel tetap melihat nilai dari bootloader. */
+          static char locked_command_line[COMMAND_LINE_SIZE];
+
+          static void __init cmdline_set_flag(char *cmd, const char *flag, const char *val)
+          {
+          	size_t flag_len = strlen(flag), val_len = strlen(val);
+          	char *pos = cmd;
+
+          	while ((pos = strstr(pos, flag))) {
+          		char *start = pos + flag_len;
+          		char *end = start + strcspn(start, " ");
+
+          		if (strlen(cmd) - (end - start) + val_len >= COMMAND_LINE_SIZE)
+          			return;
+
+          		memmove(start + val_len, end, strlen(end) + 1);
+          		memcpy(start, val, val_len);
+          		pos = start + val_len;
+          	}
+          }
+
+          /* first-stage init (dan selinux_setup) butuh nilai asli untuk keputusan AVB. */
+          static bool cmdline_reader_is_early_init(void)
+          {
+          #ifdef CONFIG_SECURITY_SELINUX
+          	u32 sid = 0;
+
+          	security_task_getsecid(current, &sid);
+          	return sid == KERNEL_INITIAL_SID;
+          #else
+          	return true;
+          #endif
+          }
+
+          static int cmdline_proc_show(struct seq_file *m, void *v)
+          {
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          	if (!susfs_spoof_cmdline_or_bootconfig(m)) {
+          		seq_putc(m, '\n');
+          		return 0;
+          	}
+          #endif
+          	if (cmdline_reader_is_early_init())
+          		seq_printf(m, "%s\n", saved_command_line);
+          	else
+          		seq_printf(m, "%s\n", locked_command_line);
+          	return 0;
+          }
+
+          static int cmdline_proc_open(struct inode *inode, struct file *file)
+          {
+          	return single_open(file, cmdline_proc_show, NULL);
+          }
+
+          static const struct file_operations cmdline_proc_fops = {
+          	.open		= cmdline_proc_open,
+          	.read		= seq_read,
+          	.llseek		= seq_lseek,
+          	.release	= single_release,
+          };
+
+          static int __init proc_cmdline_init(void)
+          {
+          	strlcpy(locked_command_line, saved_command_line, sizeof(locked_command_line));
+          	cmdline_set_flag(locked_command_line, "androidboot.verifiedbootstate=", "green");
+          	cmdline_set_flag(locked_command_line, "androidboot.flash.locked=", "1");
+          	cmdline_set_flag(locked_command_line, "androidboot.vbmeta.device_state=", "locked");
+          	cmdline_set_flag(locked_command_line, "androidboot.warranty_bit=", "0");
+          	proc_create("cmdline", 0, NULL, &cmdline_proc_fops);
+          	return 0;
+          }
+          fs_initcall(proc_cmdline_init);
+          EOF
+
+          # ── Gerbang mutu: gagal kalau ada patch yang tidak kena ──────────────────────
+          fail=0
+          check() { if eval "$2"; then echo "  OK    $1"; else echo "  GAGAL $1"; fail=1; fi; }
+          check "BakaSU di commit ${BAKASU_REF:0:12}"     "[ \"\$(git -C BakaSU rev-parse HEAD)\" = \"$BAKASU_REF\" ]"
+          check "drivers/kernelsu -> ../BakaSU/kernel"     "[ \"\$(readlink drivers/kernelsu)\" = ../BakaSU/kernel ] && [ -f drivers/kernelsu/Kbuild ]"
+          check "drivers/Kconfig & Makefile memuat kernelsu" "grep -q 'source \"drivers/kernelsu/Kconfig\"' drivers/Kconfig && grep -q 'obj-\$(CONFIG_KSU) += kernelsu/' drivers/Makefile"
+          check "UAPI kernel = $MANAGER_UAPI (sama dengan manager)" "grep -qx 'static const __u32 KERNEL_SU_UAPI_VERSION = $MANAGER_UAPI;' BakaSU/uapi/supercall.h"
+          check "rules.c: status SELinux tidak dinaikkan"  "! grep -q 'selinux_status_update_policyload' BakaSU/kernel/selinux/rules.c && [ \$(grep -c 'avc_ss_reset(' BakaSU/kernel/selinux/rules.c) -ge 2 ]"
+          check "exec.c: ksu_handle_execveat (deklarasi + 2 panggilan)" "[ \$(grep -c 'ksu_handle_execveat(' fs/exec.c) -eq 3 ] && ! grep -q 'ksu_execveat_hook\|ksu_handle_execveat_sucompat\|ksu_handle_post_execve' fs/exec.c"
+          check "open.c: ksu_handle_faccessat"             "grep -q 'ksu_handle_faccessat(&dfd, &filename, &mode, NULL)' fs/open.c"
+          check "stat.c: stat + newfstat_ret + fstat64_ret" "[ \$(grep -c 'ksu_handle_stat(&dfd' fs/stat.c) -eq 2 ] && grep -q 'ksu_handle_newfstat_ret(&fd, &statbuf)' fs/stat.c && grep -q 'ksu_handle_fstat64_ret(&fd, &statbuf)' fs/stat.c"
+          check "read_write.c: tanpa hook read KSU-Next"   "! grep -q 'ksu_vfs_read_hook\|ksu_handle_sys_read' fs/read_write.c"
+          check "input.c: tanpa hook input manual"          "! grep -q 'ksu_input_hook\|ksu_handle_input_handle_event' drivers/input/input.c"
+          check "reboot.c: ksu_handle_sys_reboot"          "grep -q 'ksu_handle_sys_reboot(magic1, magic2, cmd, &arg)' kernel/reboot.c"
+          check "hooks.c/security.c: tanpa hook terlarang" "! grep -q 'is_ksu_transition' security/selinux/hooks.c && { [ ! -f security/security.c ] || ! grep -q 'ksu_handle_rename' security/security.c; }"
+          check "ksu.config: manual hook, tanpa SUSFS"     "grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' $KCFG && ! grep -q '^CONFIG_KSU_SUSFS' $KCFG"
+          check "cmdline.c ber-gate SID kernel"            "grep -q cmdline_reader_is_early_init fs/proc/cmdline.c"
+          [ "$fail" = "0" ] || { echo "!!! Patch SETUP-H tidak lengkap — build dihentikan."; exit 1; }
+          echo "Patch SETUP-H terpasang."
+          SETUPH
+
+      # ── PENGERASAN 12: fix SID ganda selinux_hide (lihat setup-i-patch.sh) ──
+      - name: "Terapkan patch SETUP-I (fix SID ganda selinux_hide, BakaSU #623)"
+        run: |
+          bash <<'SETUPI'
+          #!/usr/bin/env bash
+          # SETUP-I: perbaikan "SID ganda" di selinux_hide BakaSU untuk tree 4.14 ProtonPlus.
+          # Dijalankan dari root tree kernel ProtonPlus, SESUDAH setup-h-patch.sh (butuh clone BakaSU/).
+          #
+          # Gejala di SETUP-H (ditemukan 20 Okt 2026): tidak ada aplikasi yang bisa exec program apa pun
+          # (getprop, sh, toybox, run-as) -> avc: denied { transition } untrusted_app -> untrusted_app,
+          # konteks sama persis. Hook setprocattr selinux_hide (UID >= 10000) memasukkan konteks aplikasi
+          # ke sidtab tanpa context_add_hash, padahal tree ini memakai sidtab ber-hash backport Google
+          # (security/selinux/ss/services.c). Akibatnya satu konteks punya 2 SID, dan setiap exec dianggap
+          # transisi domain lalu ditolak.
+          # Perbaikan = commit upstream d7260ca1 (BakaSU #623, 14 Okt 2026), dipasang TANPA commit
+          # (cherry-pick -n): HEAD tetap f4435f00, jadi version code tetap 35227 dan gerbang SETUP-H tetap
+          # berlaku. UAPI tidak berubah, jadi manager & ksud rc3 di HP tidak perlu diganti.
+          # Commit upstream lain sesudah f4435f00 sengaja tidak diambil (#612 merombak syscall hook).
+          #
+          # Sumber tunggal: workflow SETUP-I-bakasu-sidhash.yml menanam isi berkas ini apa adanya.
+          set -euo pipefail
+
+          BAKASU_PIN="f4435f007b16f61705089ff982e3f981a6017979"   # sama dengan BAKASU_REF di setup-h-patch.sh
+          FIX_SHA="${FIX_SHA:-d7260ca1e5c128061122924d0d48754e361e135c}"
+
+          # Fix ini hanya relevan untuk tree dengan sidtab ber-hash; pola sama dengan deteksi kernel_compat.mk.
+          grep -q "^int context_add_hash" security/selinux/ss/services.c || {
+            echo "!!! services.c tidak punya context_add_hash — tree ProtonPlus berubah?"; exit 1; }
+
+          git -C BakaSU cat-file -e "${FIX_SHA}^{commit}" 2>/dev/null || git -C BakaSU fetch -q origin "$FIX_SHA"
+          git -C BakaSU cherry-pick -n "$FIX_SHA"
+
+          # ── Gerbang mutu ─────────────────────────────────────────────────────────────
+          fail=0
+          check() { if eval "$2"; then echo "  OK    $1"; else echo "  GAGAL $1"; fail=1; fi; }
+          check "HEAD BakaSU tetap ${BAKASU_PIN:0:8} (version code 35227)" "[ \"\$(git -C BakaSU rev-parse HEAD)\" = $BAKASU_PIN ]"
+          check "selinux_hide.c: context_add_hash sebelum sidtab_context_to_sid (2x)" "[ \$(grep -c 'context_add_hash(' BakaSU/kernel/feature/selinux_hide.c) -eq 2 ]"
+          check "kernel_compat.mk: deteksi sidtab ber-hash"  "grep -q 'DKSU_COMPAT_HAS_CONTEXT_ADD_HASH' BakaSU/kernel/tools/kernel_compat.mk"
+          check "patch SETUP-H masih utuh (UAPI 4, rules.c)" "grep -qx 'static const __u32 KERNEL_SU_UAPI_VERSION = 4;' BakaSU/uapi/supercall.h && ! grep -q selinux_status_update_policyload BakaSU/kernel/selinux/rules.c"
+          [ "$fail" = "0" ] || { echo "!!! Patch SETUP-I tidak lengkap — build dihentikan."; exit 1; }
+          echo "Patch SETUP-I terpasang."
+          SETUPI
+
+      # ── PENGERASAN 11: NoMount built-in (lihat setup-g-patch.sh) ──
+      - name: Terapkan patch SETUP-G (NoMount built-in)
+        run: |
+          bash <<'SETUPG'
+          #!/usr/bin/env bash
+          # SETUP-G: integrasi NoMount (maxsteeel/nomount) built-in di atas SETUP-F.
+          # Dijalankan dari root tree kernel ProtonPlus, SETELAH setup-e-patch.sh & setup-f-patch.sh.
+          #
+          # Sumber tunggal: workflow SETUP-G-nomount.yml menanam isi berkas ini apa adanya.
+          set -euo pipefail
+
+          # Versi kernel NoMount harus sama dengan modul userspace yang dipasang di HP
+          # (NoMount-v2.1.1-release-7046c7a-555.zip): keduanya bicara lewat protokol keyring.
+          NOMOUNT_REF="${NOMOUNT_REF:-v2.1.1}"
+          NOMOUNT_SHA="${NOMOUNT_SHA:-7046c7ad3ee0}"
+
+          # ── PENGERASAN 11: NoMount built-in (CONFIG_NOMOUNT=y) ───────────────────────
+          # Kernel 4.14 tidak bisa memuat LKM bawaan NoMount, jadi driver-nya dikompilasi ke dalam
+          # kernel. Caranya sama dengan kernel/setup.sh resmi: clone repo, symlink fs/nomount ->
+          # NoMount/kernel/src (Makefile-nya menghitung versi dari git repo NoMount), lalu daftarkan
+          # di fs/Makefile dan fs/Kconfig (sebelum "endmenu" terakhir).
+          rm -rf NoMount
+          git clone -q https://github.com/maxsteeel/nomount NoMount
+          git -C NoMount checkout -q "$NOMOUNT_REF"
+          [ "$(git -C NoMount rev-parse --short=12 HEAD)" = "$NOMOUNT_SHA" ] || {
+            echo "!!! NoMount $NOMOUNT_REF bukan commit $NOMOUNT_SHA — tag berubah?"; exit 1; }
+
+          ln -sfn ../NoMount/kernel/src fs/nomount
+          grep -q "nomount" fs/Makefile || printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
+          if ! grep -q 'source "fs/nomount/Kconfig"' fs/Kconfig; then
+            awk '/^endmenu/ { last = NR } { line[NR] = $0 }
+                 END { for (i = 1; i <= NR; i++) { if (i == last) print "source \"fs/nomount/Kconfig\""; print line[i] } }' \
+                fs/Kconfig > fs/Kconfig.tmp && mv fs/Kconfig.tmp fs/Kconfig
+          fi
+          printf '\n# NoMount built-in (SETUP-G)\nCONFIG_NOMOUNT=y\n' >> arch/arm64/configs/vendor/ksu.config
+
+          # ── Gerbang mutu ─────────────────────────────────────────────────────────────
+          fail=0
+          check() { if eval "$2"; then echo "  OK    $1"; else echo "  GAGAL $1"; fail=1; fi; }
+          check "NoMount $NOMOUNT_REF ($NOMOUNT_SHA)" "[ -f fs/nomount/nomount.c ] && [ -f fs/nomount/Kconfig ]"
+          check "fs/Makefile memuat nomount/"         "grep -q 'obj-\$(CONFIG_NOMOUNT) += nomount/' fs/Makefile"
+          check "fs/Kconfig memuat fs/nomount/Kconfig" "grep -q 'source \"fs/nomount/Kconfig\"' fs/Kconfig"
+          check "ksu.config: CONFIG_NOMOUNT=y"        "grep -qx 'CONFIG_NOMOUNT=y' arch/arm64/configs/vendor/ksu.config"
+          [ "$fail" = "0" ] || { echo "!!! Patch SETUP-G tidak lengkap — build dihentikan."; exit 1; }
+          echo "Patch SETUP-G terpasang."
+          SETUPG
+
+
+
+      - name: Patch SELinux ksu_file (SETUP-L)
+        run: |
+          F=BakaSU/kernel/selinux/rules.c
+          [ -f "$F" ] || { echo "!! $F tidak ada"; exit 1; }
+          if grep -q 'ksu_allow(db, "domain", KERNEL_SU_FILE, ALL, ALL);' "$F"; then
+            sed -i 's|ksu_allow(db, "domain", KERNEL_SU_FILE, ALL, ALL);|ksu_allow(db, KERNEL_SU_DOMAIN, KERNEL_SU_FILE, ALL, ALL); /* SETUP-L: jangan bocor ke app */|' "$F"
+          fi
+          echo "=== baris ksu_file sekarang ==="
+          grep -n 'KERNEL_SU_FILE' "$F"
+          if grep -q 'ksu_allow(db, "domain", KERNEL_SU_FILE' "$F"; then
+            echo "!!! rule lama masih ada"; exit 1
+          fi
+          grep -q 'ksu_allow(db, KERNEL_SU_DOMAIN, KERNEL_SU_FILE' "$F" || { echo "!!! rule baru tidak terpasang"; exit 1; }
+          echo "OK: ksu_file dibatasi ke domain ksu"
+
+      - name: Aktifkan permukaan tracing (LAB — SETUP-J)
+        run: |
+          KCFG=arch/arm64/configs/vendor/ksu.config
+          cat >> "$KCFG" <<'EOF'
+
+          # ═══ SETUP-J: tracing untuk diagnosis ═══════════════════════════════
+          # Bukan untuk daily. tracefs/kprobe meninggalkan jejak yang bisa
+          # dideteksi RASP kelas tinggi; flash balik SETUP-I sesudah selesai.
+          CONFIG_DEBUG_FS=y
+          CONFIG_TRACING=y
+          CONFIG_FTRACE=y
+          CONFIG_FUNCTION_TRACER=y
+          CONFIG_DYNAMIC_FTRACE=y
+          CONFIG_STACKTRACE=y
+          CONFIG_FTRACE_SYSCALLS=y
+          CONFIG_HAVE_SYSCALL_TRACEPOINTS=y
+          CONFIG_PERF_EVENTS=y
+          CONFIG_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_UPROBES=y
+          CONFIG_UPROBE_EVENTS=y
+          CONFIG_FANOTIFY=y
+          CONFIG_FANOTIFY_ACCESS_PERMISSIONS=y
+          EOF
+          # BakaSU bisa punya simbol KSU_KPROBES_HOOK. Kalau ada, wajib MATI:
+          # root tetap lewat manual hook, kprobe kernel dipakai alat kita sendiri.
+          if grep -rqs 'config KSU_KPROBES_HOOK' BakaSU/kernel/; then
+            echo '# CONFIG_KSU_KPROBES_HOOK is not set' >> "$KCFG"
+            echo "  KSU_KPROBES_HOOK dimatikan (simbol ada di BakaSU)"
+          else
+            echo "  BakaSU tidak punya KSU_KPROBES_HOOK — tidak perlu apa-apa"
+          fi
+          echo "=== tambahan tracing ==="
+          tail -25 "$KCFG"
+
+
+      - name: Matikan NoMount (uji A/B — SETUP-K)
+        run: |
+          KCFG=arch/arm64/configs/vendor/ksu.config
+          sed -i '/CONFIG_NOMOUNT/d' "$KCFG"
+          printf '\n# SETUP-K: NoMount dimatikan agar /sys/module/nomount tidak ada\n# CONFIG_NOMOUNT is not set\n' >> "$KCFG"
+          echo "=== baris NoMount di ksu.config ==="
+          grep -n 'NOMOUNT' "$KCFG" || true
+          if grep -qx 'CONFIG_NOMOUNT=y' "$KCFG"; then echo "!!! masih =y"; exit 1; fi
+          echo "OK: CONFIG_NOMOUNT tidak aktif"
+
+      - name: Tampilkan ksu.config final
+        run: cat arch/arm64/configs/vendor/ksu.config
+
+      - name: Force build target ke a52q
+        run: sed -i 's/^DO_A72Q=1/DO_A72Q=0/' ckbuild.sh
+
+      # Port BakaSU ke kernel 4.14 non-GKI belum diuji CI upstream: "make -k" supaya satu
+      # kali build gagal menampilkan SEMUA error compile, bukan hanya yang pertama.
+      - name: make -k (kumpulkan semua error sekaligus)
+        run: |
+          sed -i 's/make -j\$(nproc --all) O=out/make -k -j$(nproc --all) O=out/' ckbuild.sh
+          [ "$(grep -c 'make -k -j' ckbuild.sh)" = "2" ] || { echo "!!! sed make -k tidak kena"; exit 1; }
+
+      - name: Build kernel (BakaSU + a52q)
+        run: |
+          chmod +x ckbuild.sh
+          bash ckbuild.sh ka52
+
+      - name: Ringkasan Kbuild BakaSU + error (kirim ini kalau build gagal)
+        if: always()
+        run: |
+          [ -f log.txt ] || { echo "log.txt tidak ada"; exit 0; }
+          echo "=== info Kbuild BakaSU ==="
+          grep -E -- "-- BakaSU|BakaSU/|BakaSU version|KERNEL_TYPE|Supported Managers" log.txt | sort -u | head -60 || true
+          echo
+          echo "=== error compile/link (maks 120 baris) ==="
+          grep -nE "error:|Error [0-9]+|undefined reference|undefined symbol|You should integrate|incompatible hook" log.txt | head -120 || true
+
+      # ── GERBANG MUTU SETUP-I: fix benar-benar ikut terkompilasi ──────────
+      - name: Verifikasi fix SETUP-I di log Kbuild
+        run: |
+          fail=0
+          check() { if grep -qF -- "$2" log.txt; then echo "  OK    $1"; else echo "  GAGAL $1"; fail=1; fi; }
+          check "kernel_compat: sidtab ber-hash terdeteksi"   "-- BakaSU/compat: found hash indexed sidtab"
+          check "version code tetap 35227 (cocok manager rc3)" "-- BakaSU version code: 35227"
+          [ "$fail" = "0" ] || { echo "!!! Fix SETUP-I tidak aktif di build ini — jangan di-flash."; exit 1; }
+          echo "Fix SETUP-I aktif (KSU_COMPAT_HAS_CONTEXT_ADD_HASH)."
+
+      # ── GERBANG MUTU: build gagal kalau ada satu saja yang meleset ────────
+      - name: Verifikasi target pengerasan di out/.config
+        run: |
+          C=out/.config
+          fail=0
+          check_set() { grep -qx "$1" "$C" && echo "  OK    $1" || { echo "  GAGAL $1"; fail=1; }; }
+          # Opsi "harus mati" bisa muncul sebagai "# X is not set" ATAU tidak muncul
+          # sama sekali (kalau dependensinya ikut mati). Keduanya benar — yang salah
+          # hanya kalau ia benar-benar =y.
+          check_off() {
+            if grep -qx "$1=y" "$C"; then
+              echo "  GAGAL $1 masih =y"; fail=1
+            elif grep -qx "# $1 is not set" "$C"; then
+              echo "  OK    $1 = n"
+            else
+              echo "  OK    $1 tidak ada di config (dependensi mati)"
+            fi
+          }
+
+          echo "=== harus AKTIF ==="
+          check_set 'CONFIG_KSU=y'
+          check_set 'CONFIG_KSU_MANUAL_HOOK=y'
+          check_set 'CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y'
+          check_set 'CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y'
+          check_set 'CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y'
+          check_set 'CONFIG_SECURITY_DMESG_RESTRICT=y'
+          check_set 'CONFIG_KALLSYMS_ALL=y'            # BakaSU mencari simbol SELinux statis lewat kallsyms
+          check_off 'CONFIG_NOMOUNT'                   # SETUP-K: NoMount dimatikan
+          echo "=== tracing (SETUP-J) ==="
+          check_set 'CONFIG_FTRACE_SYSCALLS=y'
+          check_set 'CONFIG_KPROBES=y'
+          check_set 'CONFIG_KPROBE_EVENTS=y'
+          check_set 'CONFIG_UPROBE_EVENTS=y'
+          check_set 'CONFIG_FANOTIFY=y'
+          check_off 'CONFIG_KSU_KPROBES_HOOK'
+
+          echo "=== harus MATI ==="
+          check_off 'CONFIG_KSU_SUSFS'
+          check_off 'CONFIG_KSU_TRACEPOINT_HOOK'
+          check_off 'CONFIG_KSU_DEBUG'                 # debug = adb shell root tanpa izin + log ramai
+          check_off 'CONFIG_IKCONFIG_PROC'
+
+          echo "=== LOCALVERSION ==="
+          grep '^CONFIG_LOCALVERSION=' "$C" || { echo "  GAGAL LOCALVERSION tidak ada"; fail=1; }
+          if grep -qx "CONFIG_LOCALVERSION=\"${STOCK_LOCALVERSION}\"" "$C"; then
+            echo "  OK    LOCALVERSION = ${STOCK_LOCALVERSION}"
+          else
+            echo "  GAGAL LOCALVERSION tidak tertimpa — defconfig utama menang."
+            fail=1
+          fi
+
+          [ "$fail" = "0" ] || { echo; echo "!!! Ada target pengerasan yang meleset — build dihentikan."; exit 1; }
+          echo; echo "Semua target pengerasan tercapai."
+
+      - name: Tampilkan identitas kernel hasil build
+        run: |
+          echo "=== string versi di dalam kernel hasil build ==="
+          strings -a out/arch/arm64/boot/Image* 2>/dev/null | grep -m2 "Linux version" || \
+            echo "  (terkompresi — periksa setelah flash lewat: cat /proc/version)"
+          echo
+          echo "Target yang diharapkan setelah flash:"
+          echo "  4.14.190${STOCK_LOCALVERSION} (${KBUILD_BUILD_USER}@${KBUILD_BUILD_HOST}) ... ${KBUILD_BUILD_TIMESTAMP}"
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProtonPlus-BakaSU-LAB-KSUFILE-L-a52q
+          path: ProtonPlus_Resurrected_*.zip
+          if-no-files-found: error
+
+      - name: Upload .config final (untuk audit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-config
+          path: out/.config
+          if-no-files-found: ignore
+
+      - name: Upload build log (untuk debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: log.txt
+          if-no-files-found: ignore
